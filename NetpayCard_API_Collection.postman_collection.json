@@ -1,0 +1,1535 @@
+{
+  "info": {
+    "name": "NetPay Card Backend API",
+    "_postman_id": "netpay-card-backend-v1",
+    "description": "Complete API collection for NetPay Card Backend (Node.js/Express). Base URL: http://localhost:5000/api\n\n**Auth Headers:**\n- User routes: `Authorization: Bearer {{user_token}}`\n- Admin routes: `Authorization: Bearer {{admin_token}}`\n- Merchant routes: `Authorization: Bearer {{merchant_token}}`\n- External Card API: `X-API-Key: {{api_key}}`\n\nLogin karne ke baad token automatically collection variables mein save ho jaata hai.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url",         "value": "http://localhost:5000/api", "type": "string" },
+    { "key": "user_token",       "value": "",                          "type": "string" },
+    { "key": "admin_token",      "value": "",                          "type": "string" },
+    { "key": "merchant_token",   "value": "",                          "type": "string" },
+    { "key": "api_key",          "value": "your-api-key-here",         "type": "string" },
+    { "key": "user_id",          "value": "64f1a2b3c4d5e6f7a8b9c0d1",  "type": "string" },
+    { "key": "card_id",          "value": "64f1a2b3c4d5e6f7a8b9c0d2",  "type": "string" },
+    { "key": "wasabi_card_id",   "value": "12345678",                   "type": "string" },
+    { "key": "deposit_id",       "value": "64f1a2b3c4d5e6f7a8b9c0d3",  "type": "string" },
+    { "key": "withdrawal_id",    "value": "64f1a2b3c4d5e6f7a8b9c0d4",  "type": "string" },
+    { "key": "merchant_id",      "value": "64f1a2b3c4d5e6f7a8b9c0d5",  "type": "string" },
+    { "key": "hot_wallet_id",    "value": "64f1a2b3c4d5e6f7a8b9c0d6",  "type": "string" },
+    { "key": "pcn_id",           "value": "64f1a2b3c4d5e6f7a8b9c0d7",  "type": "string" },
+    { "key": "tx_hash",          "value": "0xabc123def456",             "type": "string" },
+    { "key": "holder_id",        "value": "H0001",                      "type": "string" },
+    { "key": "imported_wallet_id","value": "64f1a2b3c4d5e6f7a8b9c0d8", "type": "string" }
+  ],
+  "item": [
+
+    {
+      "name": "1. Auth (User)",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/auth/register", "host": ["{{base_url}}"], "path": ["auth","register"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"John Doe\",\n  \"email\": \"john@example.com\",\n  \"password\": \"Password@123\",\n  \"firstName\": \"John\",\n  \"lastName\": \"Doe\",\n  \"birthday\": \"1995-05-15\",\n  \"country\": \"IN\",\n  \"phone\": \"+919876543210\",\n  \"areaCode\": \"+91\",\n  \"mobile\": \"9876543210\",\n  \"town\": \"Mumbai\",\n  \"address\": \"123 Main Street\",\n  \"postCode\": \"400001\",\n  \"merchantId\": null\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  const j = pm.response.json();",
+                  "  if (j.token) pm.collectionVariables.set('user_token', j.token);",
+                  "  if (j.user && j.user.id) pm.collectionVariables.set('user_id', j.user.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/auth/login", "host": ["{{base_url}}"], "path": ["auth","login"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"john@example.com\",\n  \"password\": \"Password@123\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const j = pm.response.json();",
+                  "  if (j.token) pm.collectionVariables.set('user_token', j.token);",
+                  "  if (j.user && j.user.id) pm.collectionVariables.set('user_id', j.user.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify 2FA",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/auth/2fa/verify", "host": ["{{base_url}}"], "path": ["auth","2fa","verify"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{user_id}}\",\n  \"code\": \"123456\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Setup 2FA (Auth Required)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/auth/2fa/setup", "host": ["{{base_url}}"], "path": ["auth","2fa","setup"] }
+          }
+        },
+        {
+          "name": "Enable 2FA (Auth Required)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/auth/2fa/enable", "host": ["{{base_url}}"], "path": ["auth","2fa","enable"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"123456\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Forgot Password",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/auth/forgot-password", "host": ["{{base_url}}"], "path": ["auth","forgot-password"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"john@example.com\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Reset Password",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/auth/reset-password", "host": ["{{base_url}}"], "path": ["auth","reset-password"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"resetToken\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...\",\n  \"password\": \"NewPassword@123\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "2. User - Profile",
+      "item": [
+        {
+          "name": "Get Profile",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/profile", "host": ["{{base_url}}"], "path": ["user","profile"] }
+          }
+        },
+        {
+          "name": "Change Password",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/profile/password", "host": ["{{base_url}}"], "path": ["user","profile","password"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"currentPassword\": \"Password@123\",\n  \"newPassword\": \"NewPassword@456\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "3. User - KYC",
+      "item": [
+        {
+          "name": "Get KYC Status",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/kyc", "host": ["{{base_url}}"], "path": ["user","kyc"] }
+          }
+        },
+        {
+          "name": "Submit KYC (form-data)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/kyc/submit", "host": ["{{base_url}}"], "path": ["user","kyc","submit"] },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "kycDocType",   "value": "passport",    "type": "text",  "description": "passport | national_id | driving_license" },
+                { "key": "kycIdNumber",  "value": "A1234567",    "type": "text" },
+                { "key": "kycIssueDate", "value": "2020-01-15",  "type": "text" },
+                { "key": "kycExpiryDate","value": "2030-01-15",  "type": "text" },
+                { "key": "gender",       "value": "M",           "type": "text",  "description": "M | F" },
+                { "key": "kycDocFront",  "src": "",              "type": "file",  "description": "ID Front image file" },
+                { "key": "kycDocBack",   "src": "",              "type": "file",  "description": "ID Back image file (optional)" },
+                { "key": "kycSelfie",    "src": "",              "type": "file",  "description": "Selfie image file (optional)" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "4. User - Wallet",
+      "item": [
+        {
+          "name": "Get Wallet",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/wallet", "host": ["{{base_url}}"], "path": ["user","wallet"] }
+          }
+        },
+        {
+          "name": "Get Supported Coins",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/wallet/deposit/coins", "host": ["{{base_url}}"], "path": ["user","wallet","deposit","coins"] }
+          }
+        },
+        {
+          "name": "Get Deposit Address",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/wallet/deposit/address", "host": ["{{base_url}}"], "path": ["user","wallet","deposit","address"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"coinKey\": \"USDT_TRC20\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "coinKey options: USDT_TRC20 | USDT_BEP20 | USDT_ERC20 | USDT_POLYGON | USDT_ARB | USDT_BASE | USDT_AVAX | USDT_OP"
+          }
+        },
+        {
+          "name": "Submit Manual Deposit",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/wallet/deposit/manual", "host": ["{{base_url}}"], "path": ["user","wallet","deposit","manual"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"txHash\": \"0xabc123def456789abcdef0123456789\",\n  \"chain\": \"TRC20\",\n  \"coinKey\": \"USDT_TRC20\",\n  \"amount\": 100\n}"
+            }
+          }
+        },
+        {
+          "name": "Deposit Status by TxHash",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/wallet/deposit/status/{{tx_hash}}", "host": ["{{base_url}}"], "path": ["user","wallet","deposit","status","{{tx_hash}}"] }
+          }
+        },
+        {
+          "name": "List Deposits",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/user/wallet/deposits?page=1&limit=20",
+              "host": ["{{base_url}}"],
+              "path": ["user","wallet","deposits"],
+              "query": [
+                { "key": "page",  "value": "1" },
+                { "key": "limit", "value": "20" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Initiate Withdrawal",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/wallet/withdraw", "host": ["{{base_url}}"], "path": ["user","wallet","withdraw"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chain\": \"TRC20\",\n  \"coinKey\": \"USDT_TRC20\",\n  \"amount\": 50,\n  \"toAddress\": \"TXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Withdrawal Status by ID",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/wallet/withdrawal/status/{{withdrawal_id}}", "host": ["{{base_url}}"], "path": ["user","wallet","withdrawal","status","{{withdrawal_id}}"] }
+          }
+        },
+        {
+          "name": "Wallet History",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/user/wallet/history?page=1&limit=20&type=deposit&status=completed",
+              "host": ["{{base_url}}"],
+              "path": ["user","wallet","history"],
+              "query": [
+                { "key": "page",   "value": "1" },
+                { "key": "limit",  "value": "20" },
+                { "key": "type",   "value": "deposit",   "description": "deposit | withdraw | card_issuance | card_topup | card_withdraw" },
+                { "key": "status", "value": "completed", "description": "pending | completed | rejected | failed" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Import Wallet",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/wallet/import", "host": ["{{base_url}}"], "path": ["user","wallet","import"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"label\": \"My ETH Wallet\",\n  \"encryptedMnemonic\": \"encrypted_mnemonic_string_here\",\n  \"encryptionIv\": \"iv_hex_string\",\n  \"encryptionTag\": \"tag_hex_string\",\n  \"evmAddress\": \"0xYourEVMAddressHere\",\n  \"tronAddress\": \"TYourTronAddressHere\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete Imported Wallet",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/wallet/import/{{imported_wallet_id}}", "host": ["{{base_url}}"], "path": ["user","wallet","import","{{imported_wallet_id}}"] }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "5. User - Cards",
+      "item": [
+        {
+          "name": "List My Cards",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/cards", "host": ["{{base_url}}"], "path": ["user","cards"] }
+          }
+        },
+        {
+          "name": "Check Holder Availability",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/user/cards/check-holder?field=email&value=cardholder@example.com",
+              "host": ["{{base_url}}"],
+              "path": ["user","cards","check-holder"],
+              "query": [
+                { "key": "field", "value": "email",                      "description": "email | mobile" },
+                { "key": "value", "value": "cardholder@example.com" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Card Fees",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/cards/fees", "host": ["{{base_url}}"], "path": ["user","cards","fees"] }
+          }
+        },
+        {
+          "name": "Apply for Virtual Card",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/cards/apply", "host": ["{{base_url}}"], "path": ["user","cards","apply"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cardType\": \"virtual\",\n  \"holder_email\": \"cardholder@example.com\",\n  \"holder_mobile\": \"9876543210\",\n  \"depositAmount\": 50\n}"
+            }
+          }
+        },
+        {
+          "name": "Apply for Physical Card",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/cards/apply", "host": ["{{base_url}}"], "path": ["user","cards","apply"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cardType\": \"physical\",\n  \"holder_email\": \"cardholder@example.com\",\n  \"holder_mobile\": \"9876543210\",\n  \"depositAmount\": 100,\n  \"deliveryInfo\": {\n    \"name\": \"John Doe\",\n    \"address\": \"123 Main Street\",\n    \"city\": \"Mumbai\",\n    \"country\": \"IN\",\n    \"postalCode\": \"400001\",\n    \"phone\": \"+919876543210\"\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Card by ID",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}"] }
+          }
+        },
+        {
+          "name": "Card Transactions",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/user/cards/{{card_id}}/transactions?page=1&start=2025-01-01&end=2025-12-31",
+              "host": ["{{base_url}}"],
+              "path": ["user","cards","{{card_id}}","transactions"],
+              "query": [
+                { "key": "page",  "value": "1" },
+                { "key": "start", "value": "2025-01-01", "description": "Start date YYYY-MM-DD (optional)" },
+                { "key": "end",   "value": "2025-12-31", "description": "End date YYYY-MM-DD (optional)" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Refresh Card Balance",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/balance", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","balance"] }
+          }
+        },
+        {
+          "name": "Top-up Card",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/topup", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","topup"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 25\n}"
+            }
+          }
+        },
+        {
+          "name": "Withdraw from Card to Wallet",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/withdraw", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","withdraw"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 20\n}"
+            }
+          }
+        },
+        {
+          "name": "Activate Physical Card",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/activate", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","activate"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pin\": \"246810\",\n  \"pinConfirmation\": \"246810\",\n  \"activeCode\": \"ACT-CODE-FROM-CARD\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Update Physical Card PIN",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{user_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/update-pin", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","update-pin"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pin\": \"358024\",\n  \"pinConfirmation\": \"358024\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Freeze Card",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/freeze", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","freeze"] }
+          }
+        },
+        {
+          "name": "Unfreeze Card",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/unfreeze", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","unfreeze"] }
+          }
+        },
+        {
+          "name": "Terminate Card",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/terminate", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","terminate"] }
+          }
+        },
+        {
+          "name": "Reveal Card Details",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{user_token}}" }],
+            "url": { "raw": "{{base_url}}/user/cards/{{card_id}}/reveal", "host": ["{{base_url}}"], "path": ["user","cards","{{card_id}}","reveal"] }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "6. Admin - Auth",
+      "item": [
+        {
+          "name": "Admin Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/admin/auth/login", "host": ["{{base_url}}"], "path": ["admin","auth","login"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@netpay.com\",\n  \"password\": \"AdminPassword@123\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const j = pm.response.json();",
+                  "  if (j.token) pm.collectionVariables.set('admin_token', j.token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+
+    {
+      "name": "7. Admin - Dashboard & Stats",
+      "item": [
+        {
+          "name": "Dashboard",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/dashboard", "host": ["{{base_url}}"], "path": ["admin","dashboard"] }
+          }
+        },
+        {
+          "name": "User Stats",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/users/stats", "host": ["{{base_url}}"], "path": ["admin","users","stats"] }
+          }
+        },
+        {
+          "name": "Transaction Stats",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/transactions/stats", "host": ["{{base_url}}"], "path": ["admin","transactions","stats"] }
+          }
+        },
+        {
+          "name": "Deposit Stats",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/deposits/stats", "host": ["{{base_url}}"], "path": ["admin","deposits","stats"] }
+          }
+        },
+        {
+          "name": "Withdrawal Stats",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/withdrawals/stats", "host": ["{{base_url}}"], "path": ["admin","withdrawals","stats"] }
+          }
+        },
+        {
+          "name": "Merchant Stats",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/merchants/stats", "host": ["{{base_url}}"], "path": ["admin","merchants","stats"] }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "8. Admin - Users",
+      "item": [
+        {
+          "name": "List Users",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/users?page=1&limit=20&search=john&kycStatus=approved&status=active",
+              "host": ["{{base_url}}"],
+              "path": ["admin","users"],
+              "query": [
+                { "key": "page",       "value": "1" },
+                { "key": "limit",      "value": "20" },
+                { "key": "search",     "value": "john",     "description": "Search by name or email" },
+                { "key": "kycStatus",  "value": "approved", "description": "pending | in_review | approved | rejected" },
+                { "key": "status",     "value": "active",   "description": "active | blocked" },
+                { "key": "merchantId", "value": "",         "description": "Filter by merchant ID (optional)", "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get User by ID",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}"] }
+          }
+        },
+        {
+          "name": "Block User",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}/block", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}","block"] }
+          }
+        },
+        {
+          "name": "Unblock User",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}/unblock", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}","unblock"] }
+          }
+        },
+        {
+          "name": "Update User KYC Status",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}/kyc", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}","kyc"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kycStatus\": \"approved\",\n  \"kycRejectReason\": null\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "kycStatus: pending | in_review | approved | rejected"
+          }
+        },
+        {
+          "name": "Update Holder ID",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}/holder-id", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}","holder-id"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"wasabiHolderId\": \"VH123456\",\n  \"wasabiPhysicalHolderId\": \"PH123456\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Add Wallet Balance",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}/add-balance", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}","add-balance"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 100,\n  \"notes\": \"Bonus credit by admin\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Login As User (Impersonate)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}/login-as", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}","login-as"] }
+          }
+        },
+        {
+          "name": "Get User Commission",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}/commission", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}","commission"] }
+          }
+        },
+        {
+          "name": "Update User Commission",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/users/{{user_id}}/commission", "host": ["{{base_url}}"], "path": ["admin","users","{{user_id}}","commission"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"commission\": {\n    \"card_issuance_virtual\":  { \"rateType\": \"percentage\", \"rate\": 2 },\n    \"card_issuance_physical\": { \"rateType\": \"fixed\",      \"rate\": 5 },\n    \"card_topup\":             { \"rateType\": \"percentage\", \"rate\": 1.5 },\n    \"deposit\":                { \"rateType\": \"percentage\", \"rate\": 0 },\n    \"withdrawal\":             { \"rateType\": \"fixed\",      \"rate\": 2 }\n  }\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "9. Admin - Transactions",
+      "item": [
+        {
+          "name": "List Transactions",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/transactions?page=1&limit=20&type=deposit&status=completed",
+              "host": ["{{base_url}}"],
+              "path": ["admin","transactions"],
+              "query": [
+                { "key": "page",   "value": "1" },
+                { "key": "limit",  "value": "20" },
+                { "key": "type",   "value": "deposit",   "description": "deposit | withdraw | card_issuance | card_topup | card_withdraw" },
+                { "key": "status", "value": "completed", "description": "pending | completed | rejected | failed" },
+                { "key": "search", "value": "",          "description": "Search by txId, txHash, user name/email", "disabled": true }
+              ]
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "10. Admin - Deposits",
+      "item": [
+        {
+          "name": "List Deposits",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/deposits?page=1&limit=20&status=pending&chain=TRC20&source=manual",
+              "host": ["{{base_url}}"],
+              "path": ["admin","deposits"],
+              "query": [
+                { "key": "page",   "value": "1" },
+                { "key": "limit",  "value": "20" },
+                { "key": "status", "value": "pending", "description": "pending | completed | rejected" },
+                { "key": "chain",  "value": "TRC20",   "description": "TRC20 | BEP20 | ERC20 | POLYGON | ARBITRUM | BASE | AVALANCHE | OPTIMISM" },
+                { "key": "source", "value": "manual",  "description": "manual | auto" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Manual Deposit (Admin)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/deposits", "host": ["{{base_url}}"], "path": ["admin","deposits"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{user_id}}\",\n  \"amount\": 200,\n  \"notes\": \"Manual deposit for testing\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Approve Deposit",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/deposits/{{deposit_id}}/approve", "host": ["{{base_url}}"], "path": ["admin","deposits","{{deposit_id}}","approve"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 200\n}",
+              "options": { "raw": { "language": "json" } },
+              "description": "amount is optional — omit to credit original deposit amount"
+            }
+          }
+        },
+        {
+          "name": "Reject Deposit",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/deposits/{{deposit_id}}/reject", "host": ["{{base_url}}"], "path": ["admin","deposits","{{deposit_id}}","reject"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Invalid transaction hash\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "11. Admin - Withdrawals",
+      "item": [
+        {
+          "name": "List Withdrawals",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/withdrawals?page=1&limit=20&status=pending",
+              "host": ["{{base_url}}"],
+              "path": ["admin","withdrawals"],
+              "query": [
+                { "key": "page",   "value": "1" },
+                { "key": "limit",  "value": "20" },
+                { "key": "status", "value": "pending", "description": "pending | approved | processing | completed | rejected | failed" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Approve Withdrawal",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/withdrawals/{{withdrawal_id}}/approve", "host": ["{{base_url}}"], "path": ["admin","withdrawals","{{withdrawal_id}}","approve"] }
+          }
+        },
+        {
+          "name": "Reject Withdrawal",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/withdrawals/{{withdrawal_id}}/reject", "host": ["{{base_url}}"], "path": ["admin","withdrawals","{{withdrawal_id}}","reject"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Suspicious activity detected\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "12. Admin - Commission",
+      "item": [
+        {
+          "name": "Get Commission Settings",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/commission-settings", "host": ["{{base_url}}"], "path": ["admin","commission-settings"] }
+          }
+        },
+        {
+          "name": "Update Commission Settings",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/commission-settings", "host": ["{{base_url}}"], "path": ["admin","commission-settings"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"settings\": [\n    { \"type\": \"deposit\",                \"rateType\": \"percentage\", \"rate\": 0 },\n    { \"type\": \"withdrawal\",             \"rateType\": \"fixed\",      \"rate\": 2 },\n    { \"type\": \"card_issuance_virtual\",  \"rateType\": \"percentage\", \"rate\": 2 },\n    { \"type\": \"card_issuance_physical\", \"rateType\": \"fixed\",      \"rate\": 10 }\n  ],\n  \"virtualCardMinDeposit\":  50,\n  \"physicalCardMinDeposit\": 100\n}"
+            }
+          }
+        },
+        {
+          "name": "Commission History",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/commission-history", "host": ["{{base_url}}"], "path": ["admin","commission-history"] }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "13. Admin - Hot Wallets",
+      "item": [
+        {
+          "name": "List Hot Wallets",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/hot-wallets", "host": ["{{base_url}}"], "path": ["admin","hot-wallets"] }
+          }
+        },
+        {
+          "name": "Create Hot Wallet",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/hot-wallets", "host": ["{{base_url}}"], "path": ["admin","hot-wallets"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chain\": \"TRC20\",\n  \"address\": \"TXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\n  \"label\": \"Main TRC20 Hot Wallet\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Toggle Hot Wallet Active",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/hot-wallets/{{hot_wallet_id}}/toggle", "host": ["{{base_url}}"], "path": ["admin","hot-wallets","{{hot_wallet_id}}","toggle"] }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "14. Admin - Cards",
+      "item": [
+        {
+          "name": "List All Cards",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/cards", "host": ["{{base_url}}"], "path": ["admin","cards"] }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "15. Admin - Physical Card Numbers",
+      "item": [
+        {
+          "name": "List Physical Card Numbers",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/physical-card-numbers", "host": ["{{base_url}}"], "path": ["admin","physical-card-numbers"] }
+          }
+        },
+        {
+          "name": "Add Physical Card Numbers",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/physical-card-numbers", "host": ["{{base_url}}"], "path": ["admin","physical-card-numbers"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cardNumbers\": [\"5234567890123456\", \"5234567890123457\", \"5234567890123458\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete Physical Card Number",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/physical-card-numbers/{{pcn_id}}", "host": ["{{base_url}}"], "path": ["admin","physical-card-numbers","{{pcn_id}}"] }
+          }
+        },
+        {
+          "name": "Assign Card to Merchant",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/physical-card-numbers/{{pcn_id}}/assign-merchant", "host": ["{{base_url}}"], "path": ["admin","physical-card-numbers","{{pcn_id}}","assign-merchant"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"merchantId\": \"{{merchant_id}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Pre-assign Card to User",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/physical-card-numbers/{{pcn_id}}/pre-assign-user", "host": ["{{base_url}}"], "path": ["admin","physical-card-numbers","{{pcn_id}}","pre-assign-user"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{user_id}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "16. Admin - Merchants",
+      "item": [
+        {
+          "name": "List Merchants",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/merchants?page=1&limit=20&status=active&type=whitelabel&search=",
+              "host": ["{{base_url}}"],
+              "path": ["admin","merchants"],
+              "query": [
+                { "key": "page",   "value": "1" },
+                { "key": "limit",  "value": "20" },
+                { "key": "status", "value": "active",     "description": "active | inactive" },
+                { "key": "type",   "value": "whitelabel", "description": "netpay_owned | whitelabel" },
+                { "key": "search", "value": "",           "description": "Search by name/email/phone" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Merchant by ID",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/merchants/{{merchant_id}}", "host": ["{{base_url}}"], "path": ["admin","merchants","{{merchant_id}}"] }
+          }
+        },
+        {
+          "name": "Create Merchant",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/merchants", "host": ["{{base_url}}"], "path": ["admin","merchants"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Acme Corp\",\n  \"tag\": \"acme\",\n  \"email\": \"merchant@acme.com\",\n  \"password\": \"Merchant@123\",\n  \"phone\": \"+14155552671\",\n  \"type\": \"whitelabel\",\n  \"titleTag\": \"Acme Pay\",\n  \"showPoweredBy\": false,\n  \"primaryColor\": \"#0066cc\",\n  \"secondaryColor\": \"#ff6600\",\n  \"virtualMinDeposit\": 25,\n  \"physicalMinDeposit\": 75\n}"
+            }
+          }
+        },
+        {
+          "name": "Update Merchant",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/merchants/{{merchant_id}}", "host": ["{{base_url}}"], "path": ["admin","merchants","{{merchant_id}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Acme Corp Updated\",\n  \"phone\": \"+14155559999\",\n  \"primaryColor\": \"#003399\",\n  \"virtualMinDeposit\": 30\n}"
+            }
+          }
+        },
+        {
+          "name": "Activate Merchant",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/merchants/{{merchant_id}}/activate", "host": ["{{base_url}}"], "path": ["admin","merchants","{{merchant_id}}","activate"] }
+          }
+        },
+        {
+          "name": "Deactivate Merchant",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/merchants/{{merchant_id}}/deactivate", "host": ["{{base_url}}"], "path": ["admin","merchants","{{merchant_id}}","deactivate"] }
+          }
+        },
+        {
+          "name": "Login As Merchant (Impersonate)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/merchants/{{merchant_id}}/login-as", "host": ["{{base_url}}"], "path": ["admin","merchants","{{merchant_id}}","login-as"] }
+          }
+        },
+        {
+          "name": "Get Merchant Commission",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/merchants/{{merchant_id}}/commission", "host": ["{{base_url}}"], "path": ["admin","merchants","{{merchant_id}}","commission"] }
+          }
+        },
+        {
+          "name": "Update Merchant Commission",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/merchants/{{merchant_id}}/commission", "host": ["{{base_url}}"], "path": ["admin","merchants","{{merchant_id}}","commission"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"commission\": {\n    \"deposit\":                { \"rateType\": \"percentage\", \"rate\": 0 },\n    \"withdrawal\":             { \"rateType\": \"fixed\",      \"rate\": 1.5 },\n    \"card_issuance_virtual\":  { \"rateType\": \"percentage\", \"rate\": 1.5 },\n    \"card_issuance_physical\": { \"rateType\": \"fixed\",      \"rate\": 8 }\n  },\n  \"virtualMinDeposit\":  25,\n  \"physicalMinDeposit\": 75\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "17. Admin - Crypto",
+      "item": [
+        {
+          "name": "Crypto Dashboard",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/dashboard", "host": ["{{base_url}}"], "path": ["admin","crypto","dashboard"] }
+          }
+        },
+        {
+          "name": "Toggle Chain",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/chains/TRC20/toggle", "host": ["{{base_url}}"], "path": ["admin","crypto","chains","TRC20","toggle"],
+              "description": "chain: TRC20 | BEP20 | ERC20 | POLYGON | ARBITRUM | BASE | AVALANCHE | OPTIMISM" }
+          }
+        },
+        {
+          "name": "List Admin Wallets",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/admin-wallets", "host": ["{{base_url}}"], "path": ["admin","crypto","admin-wallets"] }
+          }
+        },
+        {
+          "name": "Create Admin Wallet",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/crypto/admin-wallets", "host": ["{{base_url}}"], "path": ["admin","crypto","admin-wallets"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chain\": \"BEP20\",\n  \"address\": \"0xYourBEP20AddressHere\",\n  \"label\": \"Main BEP20 Sweep Wallet\",\n  \"isActive\": true\n}"
+            }
+          }
+        },
+        {
+          "name": "Update Admin Wallet",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/crypto/admin-wallets/{{hot_wallet_id}}", "host": ["{{base_url}}"], "path": ["admin","crypto","admin-wallets","{{hot_wallet_id}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"label\": \"Updated Label\",\n  \"isActive\": false\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete Admin Wallet",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/admin-wallets/{{hot_wallet_id}}", "host": ["{{base_url}}"], "path": ["admin","crypto","admin-wallets","{{hot_wallet_id}}"] }
+          }
+        },
+        {
+          "name": "Crypto Deposits List",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/deposits", "host": ["{{base_url}}"], "path": ["admin","crypto","deposits"] }
+          }
+        },
+        {
+          "name": "Crypto Withdrawals List",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/withdrawals", "host": ["{{base_url}}"], "path": ["admin","crypto","withdrawals"] }
+          }
+        },
+        {
+          "name": "Approve Crypto Withdrawal",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/withdrawals/{{withdrawal_id}}/approve", "host": ["{{base_url}}"], "path": ["admin","crypto","withdrawals","{{withdrawal_id}}","approve"] }
+          }
+        },
+        {
+          "name": "Reject Crypto Withdrawal",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/admin/crypto/withdrawals/{{withdrawal_id}}/reject", "host": ["{{base_url}}"], "path": ["admin","crypto","withdrawals","{{withdrawal_id}}","reject"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Address blacklisted\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Gas Treasury",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/gas-treasury", "host": ["{{base_url}}"], "path": ["admin","crypto","gas-treasury"] }
+          }
+        },
+        {
+          "name": "Gas Logs",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/gas-logs", "host": ["{{base_url}}"], "path": ["admin","crypto","gas-logs"] }
+          }
+        },
+        {
+          "name": "Wallet Service Logs (Crypto)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/crypto/service-logs", "host": ["{{base_url}}"], "path": ["admin","crypto","service-logs"] }
+          }
+        },
+        {
+          "name": "Wallet Service Logs (Admin)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": { "raw": "{{base_url}}/admin/wallet-service-logs", "host": ["{{base_url}}"], "path": ["admin","wallet-service-logs"] }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "18. Merchant - Auth",
+      "item": [
+        {
+          "name": "Merchant Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/merchant/auth/login", "host": ["{{base_url}}"], "path": ["merchant","auth","login"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"merchant@acme.com\",\n  \"password\": \"Merchant@123\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const j = pm.response.json();",
+                  "  if (j.token) pm.collectionVariables.set('merchant_token', j.token);",
+                  "  if (j.merchant && j.merchant.id) pm.collectionVariables.set('merchant_id', j.merchant.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+
+    {
+      "name": "19. Merchant - Portal",
+      "item": [
+        {
+          "name": "Merchant Dashboard",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchant_token}}" }],
+            "url": { "raw": "{{base_url}}/merchant/dashboard", "host": ["{{base_url}}"], "path": ["merchant","dashboard"] }
+          }
+        },
+        {
+          "name": "List Merchant Cards",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchant_token}}" }],
+            "url": { "raw": "{{base_url}}/merchant/cards", "host": ["{{base_url}}"], "path": ["merchant","cards"] }
+          }
+        },
+        {
+          "name": "List Physical Cards",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchant_token}}" }],
+            "url": { "raw": "{{base_url}}/merchant/physical-cards", "host": ["{{base_url}}"], "path": ["merchant","physical-cards"] }
+          }
+        },
+        {
+          "name": "Assign Physical Card to User",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{merchant_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/merchant/physical-cards/{{pcn_id}}/assign-user", "host": ["{{base_url}}"], "path": ["merchant","physical-cards","{{pcn_id}}","assign-user"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{user_id}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Unassign Physical Card from User",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchant_token}}" }],
+            "url": { "raw": "{{base_url}}/merchant/physical-cards/{{pcn_id}}/unassign", "host": ["{{base_url}}"], "path": ["merchant","physical-cards","{{pcn_id}}","unassign"] }
+          }
+        },
+        {
+          "name": "List Merchant Users",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{merchant_token}}" }],
+            "url": { "raw": "{{base_url}}/merchant/users", "host": ["{{base_url}}"], "path": ["merchant","users"] }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "20. External Card API (X-API-Key)",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}" }],
+            "url": { "raw": "{{base_url}}/cards/health", "host": ["{{base_url}}"], "path": ["cards","health"] }
+          }
+        },
+        {
+          "name": "Create Holder",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key",    "value": "{{api_key}}" }
+            ],
+            "url": { "raw": "{{base_url}}/cards/holder", "host": ["{{base_url}}"], "path": ["cards","holder"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{user_id}}\",\n  \"holderType\": \"virtual\"\n}",
+              "options": { "raw": { "language": "json" } },
+              "description": "holderType: virtual | physical"
+            }
+          }
+        },
+        {
+          "name": "Issue Card",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key",    "value": "{{api_key}}" }
+            ],
+            "url": { "raw": "{{base_url}}/cards/issue", "host": ["{{base_url}}"], "path": ["cards","issue"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{user_id}}\",\n  \"cardType\": \"virtual\",\n  \"holderId\": \"{{holder_id}}\",\n  \"currency\": \"USD\",\n  \"organization\": \"MasterCard\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Card Balance",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}" }],
+            "url": { "raw": "{{base_url}}/cards/{{wasabi_card_id}}/balance", "host": ["{{base_url}}"], "path": ["cards","{{wasabi_card_id}}","balance"] }
+          }
+        },
+        {
+          "name": "List Cards by Holder",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}" }],
+            "url": { "raw": "{{base_url}}/cards/holder/{{holder_id}}", "host": ["{{base_url}}"], "path": ["cards","holder","{{holder_id}}"] }
+          }
+        },
+        {
+          "name": "Get Card Transactions",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}" }],
+            "url": { "raw": "{{base_url}}/cards/{{wasabi_card_id}}/transactions", "host": ["{{base_url}}"], "path": ["cards","{{wasabi_card_id}}","transactions"] }
+          }
+        },
+        {
+          "name": "Load (Top-up) Card",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key",    "value": "{{api_key}}" }
+            ],
+            "url": { "raw": "{{base_url}}/cards/{{wasabi_card_id}}/load", "host": ["{{base_url}}"], "path": ["cards","{{wasabi_card_id}}","load"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 50\n}"
+            }
+          }
+        },
+        {
+          "name": "Unload Card",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key",    "value": "{{api_key}}" }
+            ],
+            "url": { "raw": "{{base_url}}/cards/{{wasabi_card_id}}/unload", "host": ["{{base_url}}"], "path": ["cards","{{wasabi_card_id}}","unload"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 25\n}"
+            }
+          }
+        },
+        {
+          "name": "Freeze Card (API)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}" }],
+            "url": { "raw": "{{base_url}}/cards/{{wasabi_card_id}}/freeze", "host": ["{{base_url}}"], "path": ["cards","{{wasabi_card_id}}","freeze"] }
+          }
+        },
+        {
+          "name": "Unfreeze Card (API)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}" }],
+            "url": { "raw": "{{base_url}}/cards/{{wasabi_card_id}}/unfreeze", "host": ["{{base_url}}"], "path": ["cards","{{wasabi_card_id}}","unfreeze"] }
+          }
+        },
+        {
+          "name": "Terminate Card (API)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}" }],
+            "url": { "raw": "{{base_url}}/cards/{{wasabi_card_id}}/terminate", "host": ["{{base_url}}"], "path": ["cards","{{wasabi_card_id}}","terminate"] }
+          }
+        },
+        {
+          "name": "Reveal Card Details (API)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{api_key}}" }],
+            "url": { "raw": "{{base_url}}/cards/{{wasabi_card_id}}/reveal", "host": ["{{base_url}}"], "path": ["cards","{{wasabi_card_id}}","reveal"] }
+          }
+        }
+      ]
+    }
+
+  ]
+}

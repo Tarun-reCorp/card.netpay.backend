@@ -17,6 +17,10 @@ app.use('/uploads', express.static('uploads'));
 
 app.use('/api', routes);
 
+app.get('/', (req, res) => {
+  res.send('Welcome to the NetpayCard API');
+});
+
 app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).json({ success: false, message: 'Internal server error' });

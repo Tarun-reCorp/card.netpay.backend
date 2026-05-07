@@ -13,14 +13,17 @@ router.post('/auth/login', authCtrl.login);
 router.use(merchantAuth);
 
 router.get('/dashboard', dashboard.dashboard);
+router.get('/profile',   dashboard.profile);
 
-// Cards
-router.get('/cards', cards.listCards);
+// Cards — stats must come before /:id wildcard
+router.get('/cards/stats', cards.cardStats);
+router.get('/cards',       cards.listCards);
 
-// Physical cards
-router.get('/physical-cards',                 physicalCards.listPhysicalCards);
-router.put('/physical-cards/:id/assign-user', physicalCards.assignToUser);
-router.put('/physical-cards/:id/unassign',    physicalCards.unassignFromUser);
+// Physical cards — stats must come before /:id
+router.get('/physical-cards/stats',            physicalCards.physicalCardStats);
+router.get('/physical-cards',                  physicalCards.listPhysicalCards);
+router.put('/physical-cards/:id/assign-user',  physicalCards.assignToUser);
+router.put('/physical-cards/:id/unassign',     physicalCards.unassignFromUser);
 
 // Users
 router.get('/users', users.listUsers);

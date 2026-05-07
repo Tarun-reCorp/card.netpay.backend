@@ -11,8 +11,14 @@ exports.upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
 // GET /user/kyc
 exports.getKyc = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('kycStatus kycDocType kycDocFront kycDocBack kycSelfie kycDob kycIdNumber kycIssueDate kycExpiryDate kycRejectReason kycSubmittedAt');
-    res.json({ success: true, kyc: user });
+    const user = await User.findById(req.user._id)
+      .select('kycStatus kycDocType kycDocFront kycDocBack kycSelfie kycDob kycIdNumber kycIssueDate kycExpiryDate kycRejectReason kycSubmittedAt');
+    const obj = user.toObject();
+    // Normalize Windows backslashes to forward slashes for URLs
+    ['kycDocFront', 'kycDocBack', 'kycSelfie'].forEach(k => {
+      if (obj[k]) obj[k] = obj[k].replace(/\\/g, '/');
+    });
+    res.json({ success: true, kyc: obj });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

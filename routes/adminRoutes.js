@@ -82,6 +82,8 @@ router.put('/merchants/:id/commission',     merchantCtrl.updateMerchantCommissio
 // Crypto admin
 router.get('/crypto/dashboard',                     crypto.dashboard);
 router.put('/crypto/chains/:chain/toggle',          crypto.toggleChain);
+router.get('/crypto/hot-wallets',                   crypto.listHotWallets);
+router.put('/crypto/hot-wallets/:id/toggle',        crypto.toggleHotWallet);
 router.get('/crypto/admin-wallets',                 crypto.listAdminWallets);
 router.post('/crypto/admin-wallets',                crypto.createAdminWallet);
 router.put('/crypto/admin-wallets/:id',             crypto.updateAdminWallet);

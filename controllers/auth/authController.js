@@ -4,22 +4,42 @@ const speakeasy = require('speakeasy');
 const qrcode = require('qrcode');
 const User = require('../../models/User');
 const Wallet = require('../../models/Wallet');
+const Merchant = require('../../models/Merchant');
 
 // POST /auth/register
 exports.register = async (req, res) => {
   try {
-    const { name, email, password, firstName, lastName, birthday, country, phone, areaCode, mobile, town, address, postCode, merchantId } = req.body;
+    const { name, email, password, firstName, lastName, birthday, country, phone, areaCode, mobile, town, address, postCode, merchantId, merchantTag } = req.body;
 
     const exists = await User.findOne({ email });
     if (exists) return res.status(422).json({ success: false, message: 'Email already registered' });
 
+    // Resolve merchantId from tag if provided
+    let resolvedMerchantId = merchantId || null;
+    if (!resolvedMerchantId && merchantTag) {
+      const merchant = await Merchant.findOne({ tag: merchantTag.toLowerCase(), status: 'active' });
+      if (merchant) resolvedMerchantId = merchant._id;
+    }
+
     const hashed = await bcrypt.hash(password, 12);
-    const user = await User.create({ name, email, password: hashed, firstName, lastName, birthday, country, phone, areaCode, mobile, town, address, postCode, merchantId: merchantId || null });
+    const user = await User.create({ name, email, password: hashed, firstName, lastName, birthday, country, phone, areaCode, mobile, town, address, postCode, merchantId: resolvedMerchantId });
 
     await Wallet.create({ userId: user._id });
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN });
     res.status(201).json({ success: true, token, user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// GET /auth/merchant-brand/:tag  — public, returns branding for white-label login
+exports.getMerchantBrand = async (req, res) => {
+  try {
+    const merchant = await Merchant.findOne({ tag: req.params.tag.toLowerCase(), status: 'active' })
+      .select('name tag logo primaryColor secondaryColor titleTag showPoweredBy type');
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+    res.json({ success: true, merchant });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
