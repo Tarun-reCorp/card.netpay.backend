@@ -1,3 +1,4 @@
+const jwt = require('jsonwebtoken');
 const User = require('../../models/User');
 const Wallet = require('../../models/Wallet');
 const WalletTransaction = require('../../models/WalletTransaction');
@@ -7,6 +8,7 @@ const Card = require('../../models/Card');
 const CommissionSetting = require('../../models/CommissionSetting');
 const UserCommissionSetting = require('../../models/UserCommissionSetting');
 const CommissionLedger = require('../../models/CommissionLedger');
+const AppSetting = require('../../models/AppSetting');
 const HotWallet = require('../../models/HotWallet');
 const PhysicalCardNumber = require('../../models/PhysicalCardNumber');
 const WalletServiceLog = require('../../models/WalletServiceLog');
@@ -28,22 +30,74 @@ exports.dashboard = async (req, res) => {
   }
 };
 
+// GET /admin/users/stats
+exports.userStats = async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const [total, active, blocked, todayCount, kycApproved, kycPending, kycInReview, kycRejected] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ isBlocked: false }),
+      User.countDocuments({ isBlocked: true }),
+      User.countDocuments({ createdAt: { $gte: today } }),
+      User.countDocuments({ kycStatus: 'approved' }),
+      User.countDocuments({ kycStatus: 'pending' }),
+      User.countDocuments({ kycStatus: 'in_review' }),
+      User.countDocuments({ kycStatus: { $in: ['rejected', 'not_submitted'] } }),
+    ]);
+    res.json({
+      success: true,
+      stats: { total, active, blocked, today: todayCount },
+      kyc: { approved: kycApproved, pending: kycPending, inReview: kycInReview, rejected: kycRejected },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // GET /admin/users
 exports.listUsers = async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, kycStatus, merchantId } = req.query;
+    const { page = 1, limit = 20, search, kycStatus, status, merchantId } = req.query;
     const filter = {};
     if (search) filter.$or = [{ name: new RegExp(search, 'i') }, { email: new RegExp(search, 'i') }];
     if (kycStatus) filter.kycStatus = kycStatus;
+    if (status === 'blocked') filter.isBlocked = true;
+    if (status === 'active') filter.isBlocked = false;
     if (merchantId) filter.merchantId = merchantId;
 
-    const users = await User.find(filter).select('-password -twoFactorSecret')
-      .populate('merchantId', 'name')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit));
-    const total = await User.countDocuments(filter);
-    res.json({ success: true, users, total });
+    const [users, total] = await Promise.all([
+      User.find(filter).select('-password -twoFactorSecret')
+        .populate('merchantId', 'name')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(Number(limit)),
+      User.countDocuments(filter),
+    ]);
+
+    const userIds = users.map(u => u._id);
+    const wallets = await Wallet.find({ userId: { $in: userIds } }).select('userId balance');
+    const walletMap = {};
+    wallets.forEach(w => { walletMap[w.userId.toString()] = w.balance; });
+
+    const enriched = users.map(u => ({
+      ...u.toObject(),
+      walletBalance: walletMap[u._id.toString()] ?? 0,
+    }));
+
+    res.json({ success: true, users: enriched, total });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /admin/users/:id/login-as
+exports.loginAsUser = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select('-password -twoFactorSecret');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    res.json({ success: true, token, user: { id: user._id, name: user.name, email: user.email, kycStatus: user.kycStatus } });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -115,41 +169,134 @@ exports.addWalletBalance = async (req, res) => {
   }
 };
 
+// GET /admin/transactions/stats
+exports.transactionStats = async (req, res) => {
+  try {
+    const DONE = { status: 'completed' };
+    const [total, completed, pending, rejectedFailed, manualAgg, autoAgg, cardIssuanceAgg, cardTopupAgg, completedAmtAgg] = await Promise.all([
+      WalletTransaction.countDocuments(),
+      WalletTransaction.countDocuments({ status: 'completed' }),
+      WalletTransaction.countDocuments({ status: 'pending' }),
+      WalletTransaction.countDocuments({ status: { $in: ['rejected', 'failed'] } }),
+      WalletTransaction.aggregate([{ $match: { type: 'deposit', transactionId: /^ADMIN-/i, status: 'completed' } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+      WalletTransaction.aggregate([{ $match: { type: 'deposit', transactionId: /^AUTO-/i,  status: 'completed' } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+      WalletTransaction.aggregate([{ $match: { type: 'card_issuance', status: 'completed' } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+      WalletTransaction.aggregate([{ $match: { type: 'card_topup',    status: 'completed' } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+      WalletTransaction.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    ]);
+
+    res.json({
+      success: true,
+      total, completed, pending, rejectedFailed,
+      completedAmount: completedAmtAgg[0]?.total || 0,
+      manualDeposits: { amount: manualAgg[0]?.total       || 0, count: manualAgg[0]?.count       || 0 },
+      autoDeposits:   { amount: autoAgg[0]?.total         || 0, count: autoAgg[0]?.count         || 0 },
+      cardIssuance:   { amount: cardIssuanceAgg[0]?.total || 0, count: cardIssuanceAgg[0]?.count || 0 },
+      cardTopup:      { amount: cardTopupAgg[0]?.total    || 0, count: cardTopupAgg[0]?.count    || 0 },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // GET /admin/transactions
 exports.listTransactions = async (req, res) => {
   try {
-    const { page = 1, limit = 20, type, status } = req.query;
+    const { page = 1, limit = 20, type, status, search } = req.query;
     const filter = {};
-    if (type) filter.type = type;
+    if (type)   filter.type   = type;
     if (status) filter.status = status;
 
-    const transactions = await WalletTransaction.find(filter)
-      .populate('userId', 'name email')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit));
-    const total = await WalletTransaction.countDocuments(filter);
+    if (search) {
+      const re = new RegExp(search, 'i');
+      const matchingUsers = await User.find({ $or: [{ name: re }, { email: re }] }).select('_id').lean();
+      const userIds = matchingUsers.map(u => u._id);
+      filter.$or = [
+        { transactionId: re },
+        { txHash: re },
+        { notes: re },
+        { wsbOrderNo: re },
+        ...(userIds.length ? [{ userId: { $in: userIds } }] : []),
+      ];
+    }
+
+    const [transactions, total] = await Promise.all([
+      WalletTransaction.find(filter)
+        .populate('userId', 'name email')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * Number(limit))
+        .limit(Number(limit)),
+      WalletTransaction.countDocuments(filter),
+    ]);
     res.json({ success: true, transactions, total });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// PUT /admin/deposits/:id/approve
-exports.approveDeposit = async (req, res) => {
+// GET /admin/deposits/stats
+exports.depositStats = async (req, res) => {
   try {
-    const deposit = await Deposit.findById(req.params.id);
-    if (!deposit) return res.status(404).json({ success: false, message: 'Deposit not found' });
-    if (deposit.status !== 'pending') return res.status(400).json({ success: false, message: 'Already processed' });
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    const DONE = { $in: ['confirmed', 'completed'] };
 
-    deposit.status = 'confirmed';
-    deposit.creditedAt = new Date();
-    await deposit.save();
+    const [total, completed, pending, rejected, manualAgg, autoAgg, todayAgg, completedAmountAgg] = await Promise.all([
+      Deposit.countDocuments(),
+      Deposit.countDocuments({ status: DONE }),
+      Deposit.countDocuments({ status: 'pending' }),
+      Deposit.countDocuments({ status: 'rejected' }),
+      Deposit.aggregate([{ $match: { source: 'manual', status: DONE } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+      Deposit.aggregate([{ $match: { source: 'auto',   status: DONE } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+      Deposit.aggregate([{ $match: { createdAt: { $gte: todayStart } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+      Deposit.aggregate([{ $match: { status: DONE } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    ]);
 
-    await Wallet.findOneAndUpdate({ userId: deposit.userId }, { $inc: { balance: deposit.amount } });
-    await WalletTransaction.findOneAndUpdate({ txHash: deposit.txHash }, { status: 'completed', completedAt: new Date() });
+    const trc20Wallet = await HotWallet.findOne({ chain: 'TRC20', isActive: true }).select('address');
+    const bep20Wallet = await HotWallet.findOne({ chain: 'BEP20', isActive: true }).select('address');
 
-    res.json({ success: true, message: 'Deposit approved' });
+    res.json({
+      success: true,
+      total, completed, pending, rejected,
+      manual: { amount: manualAgg[0]?.total || 0, count: manualAgg[0]?.count || 0 },
+      auto:   { amount: autoAgg[0]?.total   || 0, count: autoAgg[0]?.count   || 0 },
+      today:  { amount: todayAgg[0]?.total  || 0, count: todayAgg[0]?.count  || 0 },
+      completedAmount: completedAmountAgg[0]?.total || 0,
+      trc20Address: trc20Wallet?.address || null,
+      bep20Address: bep20Wallet?.address || null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /admin/deposits  (manual admin deposit)
+exports.createManualDeposit = async (req, res) => {
+  try {
+    const { userId, amount, notes } = req.body;
+    if (!userId || !amount || Number(amount) <= 0)
+      return res.status(422).json({ success: false, message: 'userId and a positive amount are required' });
+
+    const user = await User.findById(userId).select('name email');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const ts = Date.now();
+    const txHash = `ADMIN-${ts.toString(36).toUpperCase()}`;
+    const transactionId = `ADMIN-${ts.toString(16).toUpperCase().slice(-9)}`;
+
+    const deposit = await Deposit.create({
+      userId,
+      amount: Number(amount),
+      source: 'manual',
+      status: 'completed',
+      txHash,
+      transactionId,
+      notes: notes || 'Manually added by admin.',
+      creditedAt: new Date(),
+    });
+
+    await Wallet.findOneAndUpdate({ userId }, { $inc: { balance: Number(amount) } }, { upsert: false });
+
+    res.status(201).json({ success: true, deposit });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -158,18 +305,45 @@ exports.approveDeposit = async (req, res) => {
 // GET /admin/deposits
 exports.listDeposits = async (req, res) => {
   try {
-    const { page = 1, limit = 20, status, chain } = req.query;
+    const { page = 1, limit = 20, status, chain, source } = req.query;
     const filter = {};
     if (status) filter.status = status;
-    if (chain) filter.chain = chain;
+    if (chain)  filter.chain  = chain;
+    if (source) filter.source = source;
 
-    const deposits = await Deposit.find(filter)
-      .populate('userId', 'name email')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit));
-    const total = await Deposit.countDocuments(filter);
+    const [deposits, total] = await Promise.all([
+      Deposit.find(filter)
+        .populate('userId', 'name email')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(Number(limit)),
+      Deposit.countDocuments(filter),
+    ]);
     res.json({ success: true, deposits, total });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// PUT /admin/deposits/:id/approve
+exports.approveDeposit = async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const deposit = await Deposit.findById(req.params.id);
+    if (!deposit) return res.status(404).json({ success: false, message: 'Deposit not found' });
+    if (deposit.status !== 'pending') return res.status(400).json({ success: false, message: 'Only pending deposits can be approved' });
+
+    const creditAmount = amount ? Number(amount) : deposit.amount;
+    deposit.status = 'completed';
+    deposit.amount = creditAmount;
+    deposit.creditedAt = new Date();
+    deposit.notes = (deposit.notes ? deposit.notes + ' ' : '') + 'Approved by admin.';
+    await deposit.save();
+
+    await Wallet.findOneAndUpdate({ userId: deposit.userId }, { $inc: { balance: creditAmount } });
+    if (deposit.txHash) await WalletTransaction.findOneAndUpdate({ txHash: deposit.txHash }, { status: 'completed', completedAt: new Date() });
+
+    res.json({ success: true, message: `Deposit of ${creditAmount.toFixed(2)} USDT approved and credited` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -181,13 +355,40 @@ exports.rejectDeposit = async (req, res) => {
     const { reason } = req.body;
     const deposit = await Deposit.findById(req.params.id);
     if (!deposit) return res.status(404).json({ success: false, message: 'Deposit not found' });
+    if (deposit.status !== 'pending') return res.status(400).json({ success: false, message: 'Only pending deposits can be rejected' });
 
     deposit.status = 'rejected';
-    if (reason) deposit.rejectionReason = reason;
+    deposit.rejectedAt = new Date();
+    deposit.rejectionReason = reason || null;
+    deposit.notes = (deposit.notes ? deposit.notes + ' ' : '') + 'Rejected by admin.';
     await deposit.save();
 
-    await WalletTransaction.findOneAndUpdate({ txHash: deposit.txHash }, { status: 'rejected' });
+    if (deposit.txHash) await WalletTransaction.findOneAndUpdate({ txHash: deposit.txHash }, { status: 'rejected' });
     res.json({ success: true, message: 'Deposit rejected' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// GET /admin/withdrawals/stats
+exports.withdrawalStats = async (req, res) => {
+  try {
+    const [total, pending, approvedProcessing, completed, rejected, pendingAgg, completedAgg] = await Promise.all([
+      Withdrawal.countDocuments(),
+      Withdrawal.countDocuments({ status: 'pending' }),
+      Withdrawal.countDocuments({ status: { $in: ['approved', 'processing'] } }),
+      Withdrawal.countDocuments({ status: 'completed' }),
+      Withdrawal.countDocuments({ status: { $in: ['rejected', 'failed'] } }),
+      Withdrawal.aggregate([{ $match: { status: 'pending' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Withdrawal.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    ]);
+
+    res.json({
+      success: true,
+      total, pending, approvedProcessing, completed, rejected,
+      pendingAmount:   pendingAgg[0]?.total   || 0,
+      completedAmount: completedAgg[0]?.total  || 0,
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -200,12 +401,14 @@ exports.listWithdrawals = async (req, res) => {
     const filter = {};
     if (status) filter.status = status;
 
-    const withdrawals = await Withdrawal.find(filter)
-      .populate('userId', 'name email')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit));
-    const total = await Withdrawal.countDocuments(filter);
+    const [withdrawals, total] = await Promise.all([
+      Withdrawal.find(filter)
+        .populate('userId', 'name email')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(Number(limit)),
+      Withdrawal.countDocuments(filter),
+    ]);
     res.json({ success: true, withdrawals, total });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -217,13 +420,19 @@ exports.approveWithdrawal = async (req, res) => {
   try {
     const withdrawal = await Withdrawal.findById(req.params.id);
     if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
-    if (withdrawal.status !== 'pending') return res.status(400).json({ success: false, message: 'Already processed' });
+    if (withdrawal.status !== 'pending') return res.status(400).json({ success: false, message: 'Only pending withdrawals can be approved' });
 
     withdrawal.status = 'approved';
-    withdrawal.approvedBy = req.admin._id;
+    withdrawal.approvedBy = req.admin?._id || null;
     await withdrawal.save();
 
-    res.json({ success: true, message: 'Withdrawal approved' });
+    // Release locked balance (matches PHP: wallet.locked -= amount)
+    const wallet = await Wallet.findOne({ userId: withdrawal.userId });
+    if (wallet && wallet.locked >= withdrawal.amount) {
+      await Wallet.findOneAndUpdate({ userId: withdrawal.userId }, { $inc: { locked: -withdrawal.amount } });
+    }
+
+    res.json({ success: true, message: `Withdrawal of $${withdrawal.amount.toFixed(2)} approved. Queued for on-chain processing.` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -235,15 +444,31 @@ exports.rejectWithdrawal = async (req, res) => {
     const { reason } = req.body;
     const withdrawal = await Withdrawal.findById(req.params.id);
     if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
+    if (withdrawal.status !== 'pending') return res.status(400).json({ success: false, message: 'Only pending withdrawals can be rejected' });
 
     withdrawal.status = 'rejected';
-    withdrawal.rejectionReason = reason;
+    withdrawal.rejectionReason = reason || 'Rejected by admin.';
     await withdrawal.save();
 
-    // Refund locked funds
-    await Wallet.findOneAndUpdate({ userId: withdrawal.userId }, { $inc: { balance: withdrawal.amount, locked: -withdrawal.amount } });
+    // Refund: move locked → available balance (matches PHP)
+    const wallet = await Wallet.findOne({ userId: withdrawal.userId });
+    if (wallet) {
+      const lockedDec = Math.min(wallet.locked, withdrawal.amount);
+      await Wallet.findOneAndUpdate(
+        { userId: withdrawal.userId },
+        { $inc: { balance: withdrawal.amount, locked: -lockedDec } },
+      );
+    }
 
-    res.json({ success: true, message: 'Withdrawal rejected' });
+    // Also update WalletTransaction if one exists
+    if (withdrawal.txHash) {
+      await WalletTransaction.findOneAndUpdate(
+        { userId: withdrawal.userId, type: 'withdrawal', status: 'pending' },
+        { status: 'rejected', notes: 'Rejected by admin. Balance refunded.' },
+      );
+    }
+
+    res.json({ success: true, message: `Withdrawal rejected. $${withdrawal.amount.toFixed(2)} USDT refunded.` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -252,8 +477,29 @@ exports.rejectWithdrawal = async (req, res) => {
 // GET /admin/commission-settings
 exports.getCommissionSettings = async (req, res) => {
   try {
-    const settings = await CommissionSetting.find();
-    res.json({ success: true, settings });
+    const TYPES = ['deposit', 'withdrawal', 'card_issuance_virtual', 'card_issuance_physical'];
+
+    // Ensure all 4 types exist (firstOrCreate)
+    await Promise.all(TYPES.map(type =>
+      CommissionSetting.findOneAndUpdate(
+        { type },
+        { $setOnInsert: { rateType: 'percentage', rate: 0 } },
+        { upsert: true, new: true },
+      )
+    ));
+
+    const [settings, virtualMin, physicalMin] = await Promise.all([
+      CommissionSetting.find({ type: { $in: TYPES } }),
+      AppSetting.findOne({ key: 'virtual_card_min_deposit' }),
+      AppSetting.findOne({ key: 'physical_card_min_deposit' }),
+    ]);
+
+    res.json({
+      success: true,
+      settings,
+      virtualCardMinDeposit:  parseFloat(virtualMin?.value  || '50'),
+      physicalCardMinDeposit: parseFloat(physicalMin?.value || '50'),
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -262,11 +508,40 @@ exports.getCommissionSettings = async (req, res) => {
 // PUT /admin/commission-settings
 exports.updateCommissionSettings = async (req, res) => {
   try {
-    const { settings } = req.body; // [{ type, rateType, rate }]
-    for (const s of settings) {
-      await CommissionSetting.findOneAndUpdate({ type: s.type }, { rateType: s.rateType, rate: s.rate }, { upsert: true });
+    const { settings, virtualCardMinDeposit, physicalCardMinDeposit } = req.body;
+
+    const ops = [];
+
+    if (Array.isArray(settings)) {
+      for (const s of settings) {
+        ops.push(
+          CommissionSetting.findOneAndUpdate(
+            { type: s.type },
+            { rateType: s.rateType, rate: Number(s.rate) },
+            { upsert: true, new: true },
+          )
+        );
+      }
     }
-    res.json({ success: true, message: 'Commission settings updated' });
+
+    if (virtualCardMinDeposit !== undefined) {
+      ops.push(AppSetting.findOneAndUpdate(
+        { key: 'virtual_card_min_deposit' },
+        { value: String(Number(virtualCardMinDeposit)) },
+        { upsert: true },
+      ));
+    }
+
+    if (physicalCardMinDeposit !== undefined) {
+      ops.push(AppSetting.findOneAndUpdate(
+        { key: 'physical_card_min_deposit' },
+        { value: String(Number(physicalCardMinDeposit)) },
+        { upsert: true },
+      ));
+    }
+
+    await Promise.all(ops);
+    res.json({ success: true, message: 'Commission settings saved successfully.' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -300,17 +575,37 @@ exports.updateUserCommission = async (req, res) => {
 // GET /admin/commission-history
 exports.commissionHistory = async (req, res) => {
   try {
-    const { page = 1, limit = 20, type } = req.query;
+    const { page = 1, limit = 25, type, userId } = req.query;
     const filter = {};
-    if (type) filter.type = type;
+    if (type)   filter.type   = type;
+    if (userId) filter.userId = userId;
 
-    const records = await CommissionLedger.find(filter)
-      .populate('userId', 'name email')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit));
-    const total = await CommissionLedger.countDocuments(filter);
-    res.json({ success: true, records, total });
+    const [records, total, totalsAgg, grandTotalAgg] = await Promise.all([
+      CommissionLedger.find(filter)
+        .populate('userId', 'name email')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * Number(limit))
+        .limit(Number(limit)),
+      CommissionLedger.countDocuments(filter),
+      // Always aggregate across ALL records (not filtered) for the stat cards
+      CommissionLedger.aggregate([
+        { $group: { _id: '$type', total: { $sum: '$commissionAmount' } } },
+      ]),
+      CommissionLedger.aggregate([
+        { $group: { _id: null, total: { $sum: '$commissionAmount' } } },
+      ]),
+    ]);
+
+    const totals = {};
+    totalsAgg.forEach(t => { totals[t._id] = t.total; });
+
+    res.json({
+      success: true,
+      records,
+      total,
+      grandTotal: grandTotalAgg[0]?.total || 0,
+      totals,
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

@@ -20,22 +20,26 @@ router.post('/kyc/submit',  kyc.upload.fields([
 ]), kyc.submitKyc);
 
 // Wallet
-router.get('/wallet',                     wallet.getWallet);
-router.get('/wallet/deposit/coins',       wallet.getSupportedCoins);
-router.post('/wallet/deposit/address',    wallet.getDepositAddress);
-router.post('/wallet/deposit/manual',     wallet.submitManualDeposit);
+router.get('/wallet',                        wallet.getWallet);
+router.get('/wallet/deposit/coins',          wallet.getSupportedCoins);
+router.post('/wallet/deposit/address',       wallet.getDepositAddress);
+router.post('/wallet/deposit/manual',        wallet.submitManualDeposit);
 router.get('/wallet/deposit/status/:txHash', wallet.depositStatus);
-router.get('/wallet/deposits',            wallet.listDeposits);
-router.post('/wallet/withdraw',           wallet.initiateWithdraw);
-router.get('/wallet/withdrawal/status/:id', wallet.withdrawalStatus);
-router.get('/wallet/history',             wallet.history);
-router.post('/wallet/import',             wallet.importWallet);
-router.delete('/wallet/import/:id',       wallet.deleteImportedWallet);
+router.get('/wallet/deposits',               wallet.listDeposits);
+router.post('/wallet/withdraw',              wallet.initiateWithdraw);
+router.get('/wallet/withdrawal/status/:id',  wallet.withdrawalStatus);
+router.get('/wallet/history',                wallet.history);
+router.post('/wallet/import',                wallet.importWallet);
+router.delete('/wallet/import/:id',          wallet.deleteImportedWallet);
 
-// Cards
+// Cards — static routes MUST come before /cards/:id
 router.get('/cards',                   card.listCards);
-router.get('/cards/:id',               card.getCard);
+router.get('/cards/check-holder',      card.checkHolder);   // duplicate email/mobile check
+router.get('/cards/fees',              card.getCardFees);   // issuance fee summary
 router.post('/cards/apply',            card.applyCard);
+
+// Cards — dynamic :id routes
+router.get('/cards/:id',               card.getCard);
 router.get('/cards/:id/transactions',  card.cardTransactions);
 router.get('/cards/:id/balance',       card.refreshBalance);
 router.post('/cards/:id/topup',        card.topupCard);

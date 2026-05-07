@@ -15,6 +15,7 @@ router.use(adminAuth);
 router.get('/dashboard', admin.dashboard);
 
 // Users
+router.get('/users/stats',                    admin.userStats);
 router.get('/users',                          admin.listUsers);
 router.get('/users/:id',                      admin.getUser);
 router.put('/users/:id/block',                admin.blockUser);
@@ -22,18 +23,23 @@ router.put('/users/:id/unblock',              admin.unblockUser);
 router.put('/users/:id/kyc',                  admin.updateKyc);
 router.put('/users/:id/holder-id',            admin.updateHolderId);
 router.post('/users/:id/add-balance',         admin.addWalletBalance);
+router.post('/users/:id/login-as',            admin.loginAsUser);
 router.get('/users/:id/commission',           admin.getUserCommission);
 router.put('/users/:id/commission',           admin.updateUserCommission);
 
 // Transactions
-router.get('/transactions', admin.listTransactions);
+router.get('/transactions/stats', admin.transactionStats);
+router.get('/transactions',       admin.listTransactions);
 
 // Deposits
+router.get('/deposits/stats',       admin.depositStats);
 router.get('/deposits',             admin.listDeposits);
+router.post('/deposits',            admin.createManualDeposit);
 router.put('/deposits/:id/approve', admin.approveDeposit);
 router.put('/deposits/:id/reject',  admin.rejectDeposit);
 
 // Withdrawals
+router.get('/withdrawals/stats',        admin.withdrawalStats);
 router.get('/withdrawals',              admin.listWithdrawals);
 router.put('/withdrawals/:id/approve',  admin.approveWithdrawal);
 router.put('/withdrawals/:id/reject',   admin.rejectWithdrawal);
@@ -62,12 +68,14 @@ router.put('/physical-card-numbers/:id/pre-assign-user',  admin.preAssignUser);
 router.get('/wallet-service-logs', admin.walletServiceLogs);
 
 // Merchants
+router.get('/merchants/stats',              merchantCtrl.merchantStats);
 router.get('/merchants',                    merchantCtrl.listMerchants);
 router.get('/merchants/:id',                merchantCtrl.getMerchant);
 router.post('/merchants',                   merchantCtrl.createMerchant);
 router.put('/merchants/:id',                merchantCtrl.updateMerchant);
 router.put('/merchants/:id/activate',       merchantCtrl.activateMerchant);
 router.put('/merchants/:id/deactivate',     merchantCtrl.deactivateMerchant);
+router.post('/merchants/:id/login-as',      merchantCtrl.loginAsMerchant);
 router.get('/merchants/:id/commission',     merchantCtrl.getMerchantCommission);
 router.put('/merchants/:id/commission',     merchantCtrl.updateMerchantCommission);
 
