@@ -1,0 +1,307 @@
+const axios  = require('axios');
+const crypto = require('crypto');
+const UqpayToken = require('../models/UqpayToken');
+const UqpayCardholder = require('../models/UqpayCardholder');
+const UqpayCard = require('../models/UqpayCard');
+
+const BASE_URL = process.env.UQPAY_API_URL || 'https://api-sandbox.uqpaytech.com/api/v1';
+const TOKEN_BUFFER_SECONDS = 60;
+
+// Headers used only for token generation
+function getConnectHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    'x-api-key':   process.env.UQPAY_API_KEY,
+    'x-client-id': process.env.UQPAY_CLIENT_ID,
+  };
+}
+
+// Headers used for all authenticated UQPay API calls
+function getApiHeaders(authToken) {
+  return {
+    'Content-Type': 'application/json',
+    'x-auth-token': authToken,
+  };
+}
+
+// ── Token Management ──────────────────────────────────────────────────────────
+
+async function generateToken() {
+  console.log('[UQPay] Generating new auth token...');
+  let response;
+  try {
+    response = await axios.post(`${BASE_URL}/connect/token`, {}, { headers: getConnectHeaders() });
+  } catch (e) {
+    console.error('[UQPay] Token generation failed:', JSON.stringify(e.response?.data || e.message));
+    throw e;
+  }
+
+  const { auth_token, expired_at } = response.data;
+
+  await UqpayToken.updateMany({}, { is_active: false });
+  const token = await UqpayToken.create({ auth_token, expired_at, is_active: true });
+
+  console.log(`[UQPay] Token generated. Expires at: ${new Date(expired_at * 1000).toISOString()}`);
+  return token;
+}
+
+async function getValidToken() {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const stored = await UqpayToken.findOne({ is_active: true }).sort({ createdAt: -1 });
+
+  if (stored && stored.expired_at - TOKEN_BUFFER_SECONDS > nowSeconds) {
+    console.log('[UQPay] Reusing existing token.');
+    return stored.auth_token;
+  }
+
+  const fresh = await generateToken();
+  return fresh.auth_token;
+}
+
+// ── Cardholder ────────────────────────────────────────────────────────────────
+
+async function createCardholder({ email, first_name, last_name, country_code, phone_number, date_of_birth, gender, nationality, document_type, document, userId = null, adminId = null }) {
+  const token          = await getValidToken();
+  const idempotencyKey = crypto.randomUUID();
+
+  const payload = { email, first_name, last_name, country_code, phone_number };
+  if (date_of_birth)  payload.date_of_birth  = date_of_birth;
+  if (gender)         payload.gender         = gender;
+  if (nationality)    payload.nationality    = nationality;
+  if (document_type)  payload.document_type  = document_type;
+  if (document)       payload.document       = document;
+
+  const response = await axios.post(
+    `${BASE_URL}/issuing/cardholders`,
+    payload,
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': idempotencyKey } }
+  );
+
+  const { cardholder_id, cardholder_status } = response.data;
+
+  const cardholder = await UqpayCardholder.create({
+    userId, adminId,
+    cardholder_id, cardholder_status,
+    first_name, last_name, email, country_code, phone_number,
+    date_of_birth: date_of_birth || null,
+    gender:        gender        || null,
+    nationality:   nationality   || null,
+    document_type: document_type || null,
+  });
+
+  console.log(`[UQPay] Cardholder created: ${cardholder_id} (${cardholder_status})`);
+  return cardholder;
+}
+
+async function listCardholdersFromUQPay({ page_size = 10, page_number = 1 } = {}) {
+  const token = await getValidToken();
+  const response = await axios.get(`${BASE_URL}/issuing/cardholders`, {
+    params: { page_size, page_number },
+    headers: getApiHeaders(token),
+  });
+  return response.data;
+}
+
+async function getCardholder(cardholder_id) {
+  const token = await getValidToken();
+  const response = await axios.get(`${BASE_URL}/issuing/cardholders/${cardholder_id}`, {
+    headers: getApiHeaders(token),
+  });
+  return response.data;
+}
+
+async function updateCardholder(cardholder_id, { country_code, email, phone_number, date_of_birth, gender, nationality, document_type, document }) {
+  const token          = await getValidToken();
+  const idempotencyKey = crypto.randomUUID();
+
+  const payload = {};
+  if (country_code)  payload.country_code  = country_code;
+  if (email)         payload.email         = email;
+  if (phone_number)  payload.phone_number  = phone_number;
+  if (date_of_birth) payload.date_of_birth = date_of_birth;
+  if (gender)        payload.gender        = gender;
+  if (nationality)   payload.nationality   = nationality;
+  if (document_type) payload.document_type = document_type;
+  if (document)      payload.document      = document;
+
+  const response = await axios.post(
+    `${BASE_URL}/issuing/cardholders/${cardholder_id}`,
+    payload,
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': idempotencyKey } }
+  );
+
+  return response.data;
+}
+
+// ── Products ──────────────────────────────────────────────────────────────────
+
+async function getProducts({ page_size = 10, page_number = 1 } = {}) {
+  const token = await getValidToken();
+
+  const response = await axios.get(
+    `${BASE_URL}/issuing/products`,
+    {
+      params: { page_size, page_number },
+      headers: getApiHeaders(token),
+    }
+  );
+
+  return response.data;
+}
+
+// ── Card ──────────────────────────────────────────────────────────────────────
+
+async function createCard({
+  card_currency, cardholder_id, card_product_id, cardholderId, userId = null, adminId = null,
+  card_limit, name_on_card, spending_controls, risk_controls, metadata,
+  usage_type, auto_cancel_trigger, expiry_at, cardholder_required_fields,
+}) {
+  const token          = await getValidToken();
+  const idempotencyKey = crypto.randomUUID();
+
+  const payload = { card_currency, cardholder_id, card_product_id };
+  if (card_limit !== undefined)        payload.card_limit                 = card_limit;
+  if (name_on_card)                    payload.name_on_card               = name_on_card;
+  if (spending_controls)               payload.spending_controls          = spending_controls;
+  if (risk_controls)                   payload.risk_controls              = risk_controls;
+  if (metadata)                        payload.metadata                   = metadata;
+  if (usage_type)                      payload.usage_type                 = usage_type;
+  if (auto_cancel_trigger)             payload.auto_cancel_trigger        = auto_cancel_trigger;
+  if (expiry_at)                       payload.expiry_at                  = expiry_at;
+  if (cardholder_required_fields)      payload.cardholder_required_fields = cardholder_required_fields;
+
+  const response = await axios.post(
+    `${BASE_URL}/issuing/cards`,
+    payload,
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': idempotencyKey } }
+  );
+
+  const { card_order_id, card_id, cardholder_id: resp_cardholder_id, card_status, order_status, create_time } = response.data;
+
+  const card = await UqpayCard.create({
+    cardholderId,
+    userId,
+    adminId,
+    card_order_id,
+    card_id,
+    cardholder_id: resp_cardholder_id || cardholder_id,
+    card_status,
+    order_status,
+    card_currency,
+    card_product_id,
+    create_time: create_time ? new Date(create_time) : new Date(),
+  });
+
+  console.log(`[UQPay] Card created: ${card_id} (${card_status})`);
+  return card;
+}
+
+async function getCardInfo(card_id) {
+  const token = await getValidToken();
+  const response = await axios.get(
+    `${BASE_URL}/issuing/cards/${card_id}`,
+    { headers: getApiHeaders(token) }
+  );
+  return response.data;
+}
+
+async function listCardsFromUQPay({ page_size = 10, page_number = 1 } = {}) {
+  const token = await getValidToken();
+  const response = await axios.get(
+    `${BASE_URL}/issuing/cards`,
+    {
+      params: { page_size, page_number },
+      headers: getApiHeaders(token),
+    }
+  );
+  return response.data;
+}
+
+async function updateCard(card_id, payload) {
+  const token          = await getValidToken();
+  const idempotencyKey = crypto.randomUUID();
+  const response = await axios.post(
+    `${BASE_URL}/issuing/cards/${card_id}`,
+    payload,
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': idempotencyKey } }
+  );
+  return response.data;
+}
+
+async function rechargeCard(card_id, amount) {
+  const token          = await getValidToken();
+  const idempotencyKey = crypto.randomUUID();
+  const response = await axios.post(
+    `${BASE_URL}/issuing/cards/${card_id}/recharge`,
+    { amount },
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': idempotencyKey } }
+  );
+  return response.data;
+}
+
+async function withdrawCard(card_id, amount) {
+  const token          = await getValidToken();
+  const idempotencyKey = crypto.randomUUID();
+  const response = await axios.post(
+    `${BASE_URL}/issuing/cards/${card_id}/withdraw`,
+    { amount },
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': idempotencyKey } }
+  );
+  return response.data;
+}
+
+async function getCardOrders(card_id, params = {}) {
+  const token = await getValidToken();
+  const response = await axios.get(
+    `${BASE_URL}/issuing/cards/${card_id}/order`,
+    { params, headers: getApiHeaders(token) }
+  );
+  return response.data;
+}
+
+async function resetCardPin(card_id, pin) {
+  const token          = await getValidToken();
+  const idempotencyKey = crypto.randomUUID();
+  const response = await axios.post(
+    `${BASE_URL}/issuing/cards/pin`,
+    { card_id, pin },
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': idempotencyKey } }
+  );
+  return response.data;
+}
+
+// ── Card Sensitive Data ───────────────────────────────────────────────────────
+
+async function getCardSensitiveInfo(card_id) {
+  const token = await getValidToken();
+
+  const response = await axios.get(
+    `${BASE_URL}/issuing/cards/${card_id}/secure`,
+    { headers: getApiHeaders(token) }
+  );
+
+  return response.data;
+}
+
+// ── Card Status Update (freeze / unfreeze / cancel) ───────────────────────────
+
+async function updateCardStatus(card_id, card_status, update_reason = '') {
+  const token = await getValidToken();
+
+  const response = await axios.post(
+    `${BASE_URL}/issuing/cards/${card_id}/status`,
+    { card_status, update_reason },
+    { headers: getApiHeaders(token) }
+  );
+
+  return response.data;
+}
+
+module.exports = {
+  getValidToken,
+  createCardholder, listCardholdersFromUQPay, getCardholder, updateCardholder,
+  getProducts,
+  createCard, getCardInfo, listCardsFromUQPay, updateCard,
+  rechargeCard, withdrawCard, getCardOrders, resetCardPin,
+  updateCardStatus, getCardSensitiveInfo,
+};

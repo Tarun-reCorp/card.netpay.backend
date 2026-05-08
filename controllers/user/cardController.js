@@ -9,6 +9,8 @@ const CommissionLedger = require('../../models/CommissionLedger');
 const PhysicalCardNumber = require('../../models/PhysicalCardNumber');
 const AppSetting = require('../../models/AppSetting');
 const WasabiService = require('../../services/WasabiService');
+const UqpayService = require('../../services/UqpayService');
+const UqpayCardholder = require('../../models/UqpayCardholder');
 
 function mapWasabiStatus(s) {
   s = (s || '').toLowerCase();
@@ -44,6 +46,18 @@ async function getCommission(userId, type) {
   if (!s) s = await CommissionSetting.findOne({ type });
   return s;
 }
+
+// ── UQPay Products (for card application form) ────────────────────────────
+
+exports.getProducts = async (req, res) => {
+  try {
+    const data = await UqpayService.getProducts({ page_size: 50 });
+    const products = data.data || data.products || data.items || [];
+    res.json({ success: true, products });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
 
 // ── Check Holder Duplicate (AJAX) ─────────────────────────────────────────
 
@@ -112,24 +126,50 @@ exports.listCards = async (req, res) => {
   }
 };
 
-// ── Get Card (syncs balance/status from Wasabi) ───────────────────────────
+// ── Get Card (syncs balance/status from UQPay or Wasabi) ─────────────────
+
+function mapUqpayStatus(s = '') {
+  const u = s.toUpperCase();
+  if (u === 'ACTIVE')    return 'active';
+  if (u === 'FROZEN')    return 'frozen';
+  if (u === 'CANCELLED') return 'cancelled';
+  if (u === 'PENDING')   return 'pending';
+  return s.toLowerCase() || 'pending';
+}
 
 exports.getCard = async (req, res) => {
   try {
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
     if (!card) return res.status(404).json({ success: false, message: 'Card not found' });
 
-    if (card.wasabiCardId) {
-      const wasabi = new WasabiService();
-      const info = await wasabi.getCardInfo(card.wasabiCardId);
-      if (info) {
-        const balance = parseFloat(info.balanceInfo?.amount ?? info.availableBalance ?? info.balance ?? card.balance);
-        const status  = mapWasabiStatus(info.status || '');
-        if (balance !== card.balance || status !== card.status) {
-          card.balance = balance;
+    if (card.uqpayCardId) {
+      try {
+        const info    = await UqpayService.getCardInfo(card.uqpayCardId);
+        const status  = mapUqpayStatus(info.card_status || '');
+        const balance = parseFloat(info.balance ?? info.available_balance ?? card.balance);
+        if (status !== card.status || (!isNaN(balance) && balance !== card.balance)) {
           card.status  = status;
+          if (!isNaN(balance)) card.balance = balance;
           await card.save();
         }
+      } catch (e) {
+        console.error('[getCard] UQPay sync failed:', e.response?.data || e.message);
+      }
+    } else if (card.wasabiCardId) {
+      try {
+        const wasabi = new WasabiService();
+        const info   = await wasabi.getCardInfo(card.wasabiCardId);
+        if (info) {
+          const balance = parseFloat(info.balanceInfo?.amount ?? info.availableBalance ?? info.balance ?? card.balance);
+          const status  = mapWasabiStatus(info.status || '');
+          if (balance !== card.balance || status !== card.status) {
+            card.balance = balance;
+            card.status  = status;
+            await card.save();
+          }
+        }
+      } catch (e) {
+        console.error('[getCard] Wasabi sync failed:', e.message);
       }
     }
 
@@ -144,12 +184,10 @@ exports.getCard = async (req, res) => {
 exports.applyCard = async (req, res) => {
   try {
     const {
-      cardType     = 'virtual',
-      card_type_id,
-      holder_email,
-      holder_mobile,
-      depositAmount: depositAmt,
-      deliveryInfo,
+      cardType        = 'virtual',
+      card_product_id,
+      card_currency   = 'USD',
+      depositAmount   : depositAmt,
     } = req.body;
 
     if (!['virtual', 'physical'].includes(cardType)) {
@@ -160,45 +198,11 @@ exports.applyCard = async (req, res) => {
       return res.status(403).json({ success: false, message: 'KYC approval required to apply for a card.' });
     }
 
-    if (!holder_email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(holder_email)) {
-      return res.status(400).json({ success: false, message: 'A valid cardholder email is required.' });
-    }
-    if (!holder_mobile) {
-      return res.status(400).json({ success: false, message: 'Cardholder mobile number is required.' });
+    if (!card_product_id) {
+      return res.status(400).json({ success: false, message: 'Please select a card product.' });
     }
 
-    const emailTaken  = await Card.exists({ holderEmail: holder_email.trim(), status: { $ne: 'cancelled' } });
-    if (emailTaken)  return res.status(400).json({ success: false, message: 'This email is already linked to another cardholder.' });
-
-    const mobileTaken = await Card.exists({ holderMobile: holder_mobile.trim(), status: { $ne: 'cancelled' } });
-    if (mobileTaken) return res.status(400).json({ success: false, message: 'This mobile number is already linked to another cardholder.' });
-
-    if (cardType === 'physical') {
-      const di = deliveryInfo || {};
-      if (!di.name || !di.address || !di.city || !di.country || !di.postalCode || !di.phone) {
-        return res.status(400).json({ success: false, message: 'Complete delivery info (name, address, city, country, postal code, phone) required for physical cards.' });
-      }
-    }
-
-    const user = req.user;
-    const missing = [];
-    if (!user.gender)        missing.push('Gender');
-    if (!user.birthday)      missing.push('Date of birth');
-    if (!user.areaCode)      missing.push('Phone area code');
-    if (!user.mobile)        missing.push('Mobile number');
-    if (!user.town)          missing.push('City/Town');
-    if (!user.address)       missing.push('Address');
-    if (!user.postCode)      missing.push('Postal code');
-    if (!user.country)       missing.push('Country');
-    if (!user.kycDocType)    missing.push('ID type (re-submit KYC)');
-    if (!user.kycIdNumber)   missing.push('ID number (re-submit KYC)');
-    if (!user.kycIssueDate)  missing.push('ID issue date (re-submit KYC)');
-    if (!user.kycExpiryDate) missing.push('ID expiry date (re-submit KYC)');
-    if (!user.kycDocFront)   missing.push('ID front image (re-submit KYC)');
-    if (missing.length > 0) {
-      return res.status(400).json({ success: false, message: 'Missing required information: ' + missing.join(', ') });
-    }
-
+    const user   = req.user;
     const wallet = await Wallet.findOne({ userId: user._id });
     if (!wallet) return res.status(404).json({ success: false, message: 'Wallet not found' });
 
@@ -226,136 +230,44 @@ exports.applyCard = async (req, res) => {
       });
     }
 
-    // Physical card pool
-    let assignedCardNumber = null;
-    if (cardType === 'physical') {
-      // Prefer pre-assigned → merchant pool → general pool
-      assignedCardNumber = await PhysicalCardNumber.findOneAndUpdate(
-        {
-          isUsed: false,
-          $or: [
-            { preAssignedUserId: user._id },
-            { merchantId: user.merchantId || null, preAssignedUserId: null },
-            { merchantId: null, preAssignedUserId: null },
-          ],
-        },
-        { $set: { isUsed: true, usedAt: new Date() } },
-        { new: true, sort: { preAssignedUserId: -1 } }
-      );
-      if (!assignedCardNumber) {
-        return res.status(400).json({ success: false, message: 'No physical card numbers available right now. Please contact support.' });
+    // ── Find or create UQPay cardholder for this user ─────────────────────
+    let cardholder = await UqpayCardholder.findOne({ userId: user._id });
+
+    if (!cardholder) {
+      const firstName   = user.firstName || (user.name || '').split(' ')[0] || 'User';
+      const lastName    = user.lastName  || (user.name || '').split(' ').slice(1).join(' ') || firstName;
+      const countryCode = (user.country || 'US').trim().toUpperCase().slice(0, 2);
+      const phoneNumber = user.mobile || user.phone || '0000000000';
+
+      const chPayload = { email: user.email, first_name: firstName, last_name: lastName, country_code: countryCode, phone_number: phoneNumber };
+      console.log('[UQPay] Creating cardholder:', chPayload);
+
+      try {
+        cardholder = await UqpayService.createCardholder({ ...chPayload, userId: user._id });
+      } catch (chErr) {
+        const errData = chErr.response?.data;
+        console.error('[UQPay] Cardholder creation failed:', JSON.stringify(errData || chErr.message));
+        const msg = errData?.message || errData?.error || errData?.msg || chErr.message;
+        return res.status(422).json({ success: false, message: 'Cardholder creation failed: ' + msg });
       }
     }
 
-    const wasabi       = new WasabiService();
-    const isPhysical   = cardType === 'physical';
-    const holderColumn = isPhysical ? 'wasabiPhysicalHolderId' : 'wasabiHolderId';
-    let   holderId     = isPhysical ? user.wasabiPhysicalHolderId : user.wasabiHolderId;
-    const cardTypeId   = card_type_id ? Number(card_type_id)
-      : isPhysical
-        ? (Number(process.env.WASABI_PHYSICAL_CARD_TYPE_ID) || 2)
-        : (Number(process.env.WASABI_VIRTUAL_CARD_TYPE_ID)  || 1);
-
-    if (!holderId) {
-      const idTypeMap  = { passport: 1, national_id: 2, driving_license: 3 };
-      const idType     = idTypeMap[user.kycDocType] || 1;
-      const orderPfx   = isPhysical ? 'HLDP' : 'HLD';
-      const orderNo    = orderPfx + String(user._id).slice(-10).padStart(10, '0');
-      const areaCode   = (user.areaCode || '').startsWith('+') ? user.areaCode : '+' + user.areaCode;
-      const mobile     = (isPhysical && deliveryInfo?.phone)
-        ? (deliveryInfo.phone + '').replace(/\D/g, '')
-        : (user.mobile || '');
-
-      const idFrontId = await wasabi.uploadKycFile(user.kycDocFront);
-      if (!idFrontId) {
-        if (assignedCardNumber) await PhysicalCardNumber.findByIdAndUpdate(assignedCardNumber._id, { $set: { isUsed: false, usedAt: null, cardId: null } });
-        return res.status(500).json({ success: false, message: 'Failed to upload ID document. Please contact support.' });
-      }
-      const idBackId = user.kycDocBack ? await wasabi.uploadKycFile(user.kycDocBack) : null;
-      const idHoldId = user.kycSelfie  ? await wasabi.uploadKycFile(user.kycSelfie)  : null;
-
-      const payload = {
-        cardHolderModel : 'B2C',
-        cardTypeId,
-        gender          : user.gender,
-        idType,
-        idNumber        : user.kycIdNumber,
-        issueDate       : user.kycIssueDate  ? new Date(user.kycIssueDate).toISOString().split('T')[0]  : null,
-        idNoExpiryDate  : user.kycExpiryDate ? new Date(user.kycExpiryDate).toISOString().split('T')[0] : null,
-        idFrontId,
-        ...(idBackId ? { idBackId } : {}),
-        ...(idHoldId ? { idHoldId } : {}),
-        nationality     : (user.country || '').toUpperCase(),
-        merchantOrderNo : orderNo,
-        firstName       : user.firstName || (user.name || '').split(' ')[0] || '',
-        lastName        : user.lastName  || (user.name || '').split(' ').slice(1).join(' ') || '',
-        email           : holder_email.trim(),
-        areaCode,
-        mobile,
-        birthday        : user.birthday   ? new Date(user.birthday).toISOString().split('T')[0]   : null,
-        country         : (user.country || '').toUpperCase(),
-        town            : user.town,
-        address         : (user.address || '').replace(/\s+/g, ' ').trim(),
-        postCode        : user.postCode,
-      };
-
-      let holderResult = await wasabi.createHolder(payload);
-
-      if (!holderResult) {
-        // Retry with fresh orderNo (same as PHP)
-        const freshOrderNo = orderPfx + String(user._id).slice(-8).padStart(8, '0') + 'R' + Date.now();
-        payload.merchantOrderNo = freshOrderNo;
-        holderResult = await wasabi.createHolder(payload);
-
-        if (!holderResult) {
-          if (assignedCardNumber) await PhysicalCardNumber.findByIdAndUpdate(assignedCardNumber._id, { $set: { isUsed: false, usedAt: null, cardId: null } });
-          return res.status(500).json({ success: false, message: wasabi.lastError() || 'Failed to create cardholder. Please try again.' });
-        }
-
-        holderId = holderResult.holderId || holderResult.id || holderResult.cardHolderId || holderResult.holderNo;
-        if (!holderId) holderId = await wasabi.findHolderByOrderNo(freshOrderNo);
-      } else {
-        holderId = holderResult.holderId || holderResult.id || holderResult.cardHolderId || holderResult.holderNo;
-        if (!holderId) holderId = await wasabi.findHolderByOrderNo(orderNo);
-        if (!holderId) holderId = await wasabi.findHolderByEmail(holder_email.trim(), cardTypeId);
-      }
-
-      if (!holderId) {
-        if (assignedCardNumber) await PhysicalCardNumber.findByIdAndUpdate(assignedCardNumber._id, { $set: { isUsed: false, usedAt: null, cardId: null } });
-        return res.status(500).json({ success: false, message: 'Cardholder exists on provider but ID could not be retrieved. Please contact support.' });
-      }
-      holderId = String(holderId);
-      await User.findByIdAndUpdate(user._id, { [holderColumn]: holderId });
-    }
-
-    // PHASE 1 — deduct wallet + create card record (status=processing)
+    // ── PHASE 1: deduct wallet + create local Card record ─────────────────
     const txnId = 'CARD-' + crypto.randomBytes(8).toString('hex').toUpperCase();
 
     wallet.balance = Math.round((wallet.balance - totalCharge) * 100) / 100;
     await wallet.save();
 
     const card = await Card.create({
-      userId      : user._id,
-      wasabiHolderId: holderId,
-      wasabiCardId: null,
-      cardNo      : assignedCardNumber ? assignedCardNumber.cardNumber : null,
-      organization: 'MasterCard',
-      currency    : 'USD',
+      userId            : user._id,
+      uqpayCardholderId : cardholder.cardholder_id,
+      currency          : card_currency,
       cardType,
-      deliveryInfo: deliveryInfo || null,
-      status      : 'processing',
-      balance     : 0,
-      expireDate  : null,
+      status            : 'processing',
+      balance           : 0,
       depositAmount,
       feeAmount,
-      merchantOrderNo: null,
-      holderEmail : holder_email.trim(),
-      holderMobile: holder_mobile.trim(),
     });
-
-    if (assignedCardNumber) {
-      await PhysicalCardNumber.findByIdAndUpdate(assignedCardNumber._id, { $set: { cardId: card._id } });
-    }
 
     await WalletTransaction.create({
       userId        : user._id,
@@ -379,35 +291,31 @@ exports.applyCard = async (req, res) => {
       });
     }
 
-    // PHASE 2 — issue card on Wasabi
-    const issueParams = {
-      merchantOrderNo : 'MC-' + crypto.randomBytes(8).toString('hex'),
-      holderId,
-      cardTypeId,
-      ...(cardType === 'physical' && assignedCardNumber ? { cardNumber: assignedCardNumber.cardNumber } : {}),
-      ...(cardType === 'physical' && deliveryInfo       ? { deliveryAddress: deliveryInfo } : {}),
-    };
-
-    const issueResult = await wasabi.createCard(issueParams);
-
-    if (!issueResult) {
-      const err = (wasabi.lastError() || '').toLowerCase();
-      if (err.includes('cardholder does not exist') || err.includes('cardholder verification failed')) {
-        await User.findByIdAndUpdate(user._id, { [holderColumn]: null });
-      }
-      // Rollback
+    // ── PHASE 2: issue card on UQPay ──────────────────────────────────────
+    let uqpayCard;
+    try {
+      uqpayCard = await UqpayService.createCard({
+        card_currency,
+        cardholder_id : cardholder.cardholder_id,
+        card_product_id,
+        cardholderId  : cardholder._id,
+        userId        : user._id,
+      });
+    } catch (uqErr) {
+      // Rollback wallet deduction
       wallet.balance = Math.round((wallet.balance + totalCharge) * 100) / 100;
       await wallet.save();
       await Card.findByIdAndUpdate(card._id, { status: 'failed' });
-      if (assignedCardNumber) {
-        await PhysicalCardNumber.findByIdAndUpdate(assignedCardNumber._id, { $set: { isUsed: false, cardId: null, usedAt: null } });
-      }
-      const msg = wasabi.lastError() || 'Card issuance failed. Please try again.';
+      const errData = uqErr.response?.data;
+      console.error('[UQPay] Card creation failed:', JSON.stringify(errData || uqErr.message));
+      const msg = errData?.message || errData?.error || errData?.msg || uqErr.message || 'Card issuance failed. Please try again.';
       return res.status(422).json({ success: false, message: msg });
     }
 
-    const wasabiCardId = issueResult.cardNo || issueResult.cardId || issueResult.id || null;
-    await Card.findByIdAndUpdate(card._id, { wasabiCardId: wasabiCardId ? String(wasabiCardId) : null, status: 'pending', expireDate: issueResult.expireDate || null });
+    await Card.findByIdAndUpdate(card._id, {
+      uqpayCardId : uqpayCard.card_id,
+      status      : 'pending',
+    });
 
     res.status(201).json({
       success : true,
@@ -415,20 +323,53 @@ exports.applyCard = async (req, res) => {
       cardId  : card._id,
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    const errData = err.response?.data;
+    console.error('[applyCard] Unexpected error:', JSON.stringify(errData || err.message));
+    const msg = errData?.message || errData?.error || errData?.msg || err.message;
+    res.status(500).json({ success: false, message: msg });
   }
 };
 
-// ── Transactions (paginated, date-filtered) ───────────────────────────────
+// ── Transactions (paginated) ──────────────────────────────────────────────
 
 exports.cardTransactions = async (req, res) => {
   try {
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!card || !card.wasabiCardId) return res.status(404).json({ success: false, message: 'Card not found' });
+    if (!card) return res.status(404).json({ success: false, message: 'Card not found' });
 
     const pageNum  = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = 20;
-    const filters  = { pageNum, pageSize };
+
+    if (card.uqpayCardId) {
+      try {
+        const result = await UqpayService.getCardOrders(card.uqpayCardId, {
+          page_size  : pageSize,
+          page_number: pageNum,
+        });
+        const items = result.data || result.orders || result.items || result.records || [];
+        const total = result.total_count || result.total || items.length;
+        return res.json({
+          success     : true,
+          transactions: items.map(t => ({
+            description: t.description || t.order_type || t.type || 'Transaction',
+            amount     : t.amount      || t.transaction_amount || 0,
+            date       : t.create_time || t.created_at || t.createdAt,
+            type       : t.order_type  || t.type,
+            status     : t.order_status || t.status,
+          })),
+          total,
+          page    : pageNum,
+          lastPage: Math.max(1, Math.ceil(total / pageSize)),
+        });
+      } catch (e) {
+        const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+        return res.status(422).json({ success: false, message: msg });
+      }
+    }
+
+    if (!card.wasabiCardId) return res.status(404).json({ success: false, message: 'Card provider reference not found' });
+
+    const filters = { pageNum, pageSize };
     if (req.query.start) filters.startTime = req.query.start + ' 00:00:00';
     if (req.query.end)   filters.endTime   = req.query.end   + ' 23:59:59';
 
@@ -463,8 +404,8 @@ exports.topupCard = async (req, res) => {
     let commSetting = await UserCommissionSetting.findOne({ userId: req.user._id, type: 'card_topup' });
     if (!commSetting) commSetting = await CommissionSetting.findOne({ type: 'card_topup' });
 
-    const feeRate    = commSetting?.rateType === 'percentage' ? commSetting.rate : 1.5;
-    const fee        = Math.round(Number(amount) * feeRate / 100 * 100) / 100;
+    const feeRate     = commSetting?.rateType === 'percentage' ? commSetting.rate : 1.5;
+    const fee         = Math.round(Number(amount) * feeRate / 100 * 100) / 100;
     const totalCharge = Math.round((Number(amount) + fee) * 100) / 100;
 
     if (wallet.balance < totalCharge) {
@@ -474,9 +415,21 @@ exports.topupCard = async (req, res) => {
       });
     }
 
-    const wasabi = new WasabiService();
-    const result = await wasabi.depositToCard(card.wasabiCardId, 'TOPUP-' + Date.now(), Number(amount));
-    if (!result) return res.status(422).json({ success: false, message: wasabi.lastError() || 'Top-up failed. Please try again.' });
+    // Call card provider
+    if (card.uqpayCardId) {
+      try {
+        await UqpayService.rechargeCard(card.uqpayCardId, Number(amount));
+      } catch (e) {
+        const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+        return res.status(422).json({ success: false, message: msg || 'Top-up failed. Please try again.' });
+      }
+    } else if (card.wasabiCardId) {
+      const wasabi = new WasabiService();
+      const result = await wasabi.depositToCard(card.wasabiCardId, 'TOPUP-' + Date.now(), Number(amount));
+      if (!result) return res.status(422).json({ success: false, message: wasabi.lastError() || 'Top-up failed. Please try again.' });
+    } else {
+      return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    }
 
     wallet.balance = Math.round((wallet.balance - totalCharge) * 100) / 100;
     await wallet.save();
@@ -514,9 +467,21 @@ exports.withdrawFromCard = async (req, res) => {
     if (!card)                    return res.status(404).json({ success: false, message: 'Card not found' });
     if (card.status !== 'active') return res.status(400).json({ success: false, message: 'Withdraw is only available for active cards.' });
 
-    const wasabi = new WasabiService();
-    const result = await wasabi.withdrawFromCard(card.wasabiCardId, 'WDR-' + Date.now(), Number(amount));
-    if (!result) return res.status(422).json({ success: false, message: wasabi.lastError() || 'Withdraw failed. Please try again.' });
+    // Call card provider
+    if (card.uqpayCardId) {
+      try {
+        await UqpayService.withdrawCard(card.uqpayCardId, Number(amount));
+      } catch (e) {
+        const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+        return res.status(422).json({ success: false, message: msg || 'Withdraw failed. Please try again.' });
+      }
+    } else if (card.wasabiCardId) {
+      const wasabi = new WasabiService();
+      const result = await wasabi.withdrawFromCard(card.wasabiCardId, 'WDR-' + Date.now(), Number(amount));
+      if (!result) return res.status(422).json({ success: false, message: wasabi.lastError() || 'Withdraw failed. Please try again.' });
+    } else {
+      return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    }
 
     const wallet = await Wallet.findOne({ userId: req.user._id });
     wallet.balance = Math.round((wallet.balance + Number(amount)) * 100) / 100;
@@ -543,10 +508,14 @@ exports.freezeCard = async (req, res) => {
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
     if (!card)                    return res.status(404).json({ success: false, message: 'Card not found' });
     if (card.status !== 'active') return res.status(400).json({ success: false, message: 'Only active cards can be frozen.' });
+    if (!card.uqpayCardId)        return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
 
-    const wasabi = new WasabiService();
-    const result = await wasabi.freezeCard(card.wasabiCardId);
-    if (result === null) return res.status(422).json({ success: false, message: wasabi.lastError() || 'Failed to freeze card. Please try again.' });
+    try {
+      await UqpayService.updateCardStatus(card.uqpayCardId, 'FROZEN', 'User requested freeze');
+    } catch (e) {
+      const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+      return res.status(422).json({ success: false, message: msg || 'Failed to freeze card. Please try again.' });
+    }
 
     card.status = 'frozen';
     await card.save();
@@ -563,10 +532,14 @@ exports.unfreezeCard = async (req, res) => {
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
     if (!card)                    return res.status(404).json({ success: false, message: 'Card not found' });
     if (card.status !== 'frozen') return res.status(400).json({ success: false, message: 'Only frozen cards can be unfrozen.' });
+    if (!card.uqpayCardId)        return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
 
-    const wasabi = new WasabiService();
-    const result = await wasabi.unfreezeCard(card.wasabiCardId);
-    if (result === null) return res.status(422).json({ success: false, message: wasabi.lastError() || 'Failed to unfreeze card. Please try again.' });
+    try {
+      await UqpayService.updateCardStatus(card.uqpayCardId, 'ACTIVE', 'User requested unfreeze');
+    } catch (e) {
+      const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+      return res.status(422).json({ success: false, message: msg || 'Failed to unfreeze card. Please try again.' });
+    }
 
     card.status = 'active';
     await card.save();
@@ -581,17 +554,15 @@ exports.unfreezeCard = async (req, res) => {
 exports.terminateCard = async (req, res) => {
   try {
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!card)                      return res.status(404).json({ success: false, message: 'Card not found' });
+    if (!card)                       return res.status(404).json({ success: false, message: 'Card not found' });
     if (card.status === 'cancelled') return res.status(400).json({ success: false, message: 'Card is already terminated.' });
+    if (!card.uqpayCardId)           return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
 
-    const wasabi = new WasabiService();
-    const result = await wasabi.cancelCard(card.wasabiCardId);
-    if (result === null) {
-      const err = wasabi.lastError() || '';
-      const msg = err.toLowerCase().includes('not support')
-        ? 'This card product does not support termination via API. Please contact support to cancel this card.'
-        : (err || 'Failed to terminate card. Please try again.');
-      return res.status(422).json({ success: false, message: msg });
+    try {
+      await UqpayService.updateCardStatus(card.uqpayCardId, 'CANCELLED', 'User requested termination');
+    } catch (e) {
+      const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+      return res.status(422).json({ success: false, message: msg || 'Failed to terminate card. Please try again.' });
     }
 
     card.status = 'cancelled';
@@ -608,21 +579,41 @@ exports.revealCard = async (req, res) => {
   try {
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
     if (!card) return res.status(404).json({ success: false, message: 'Card not found' });
-    if (!['active', 'frozen'].includes(card.status)) {
-      return res.status(422).json({ success: false, message: 'Card is not active.' });
-    }
-    if (!card.wasabiCardId) return res.status(422).json({ success: false, message: 'Card reference not found.' });
+    if (!card.uqpayCardId) return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
 
-    const wasabi = new WasabiService();
-    const info = await wasabi.getSensitiveInfo(card.wasabiCardId);
-    if (!info) return res.status(422).json({ success: false, message: wasabi.lastError() || 'Failed to reveal card info.' });
+    // Sync latest status from UQPay before checking — card may still be 'pending' in DB
+    // even though UQPay already activated it
+    try {
+      const latest = await UqpayService.getCardInfo(card.uqpayCardId);
+      const synced = mapUqpayStatus(latest.card_status || '');
+      if (synced !== card.status) {
+        card.status = synced;
+        await card.save();
+      }
+    } catch (syncErr) {
+      console.error('[revealCard] UQPay status sync failed:', syncErr.response?.data || syncErr.message);
+    }
+
+    if (!['active', 'frozen'].includes(card.status)) {
+      return res.status(422).json({ success: false, message: `Card cannot be revealed in status: ${card.status}.` });
+    }
+
+    let info;
+    try {
+      info = await UqpayService.getCardSensitiveInfo(card.uqpayCardId);
+      console.log('[revealCard] UQPay secure response:', JSON.stringify(info));
+    } catch (e) {
+      console.error('[revealCard] UQPay secure error:', JSON.stringify(e.response?.data || e.message));
+      const msg = e.response?.data?.message || e.response?.data?.error || e.response?.data?.msg || e.message;
+      return res.status(422).json({ success: false, message: msg || 'Failed to retrieve card details from provider.' });
+    }
 
     res.json({
       success    : true,
       cardDetails: {
-        cardNumber : info.cardNumber || '',
-        cvv        : info.cvv        || '',
-        expireDate : info.expireDate  || '',
+        cardNumber : info.card_number  || info.cardNumber  || info.pan          || '',
+        cvv        : info.cvv          || info.cvc         || info.cvv2         || '',
+        expireDate : info.expiry_date  || info.expireDate  || info.expire_date  || info.expiry || '',
       },
     });
   } catch (err) {
@@ -636,15 +627,28 @@ exports.refreshBalance = async (req, res) => {
   try {
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
     if (!card) return res.status(404).json({ success: false, message: 'Card not found' });
-    if (!card.wasabiCardId) return res.json({ success: true, balance: card.balance, status: card.status });
 
-    const wasabi = new WasabiService();
-    const info = await wasabi.getCardInfo(card.wasabiCardId);
-    if (info) {
-      card.balance = parseFloat(info.balanceInfo?.amount ?? info.availableBalance ?? info.balance ?? card.balance);
-      card.status  = mapWasabiStatus(info.status || '');
-      await card.save();
+    if (card.uqpayCardId) {
+      try {
+        const info    = await UqpayService.getCardInfo(card.uqpayCardId);
+        const status  = mapUqpayStatus(info.card_status || '');
+        const balance = parseFloat(info.balance ?? info.available_balance ?? card.balance);
+        card.status   = status;
+        if (!isNaN(balance)) card.balance = balance;
+        await card.save();
+      } catch (e) {
+        console.error('[refreshBalance] UQPay sync failed:', e.response?.data || e.message);
+      }
+    } else if (card.wasabiCardId) {
+      const wasabi = new WasabiService();
+      const info   = await wasabi.getCardInfo(card.wasabiCardId);
+      if (info) {
+        card.balance = parseFloat(info.balanceInfo?.amount ?? info.availableBalance ?? info.balance ?? card.balance);
+        card.status  = mapWasabiStatus(info.status || '');
+        await card.save();
+      }
     }
+
     res.json({ success: true, balance: card.balance, status: card.status });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -672,6 +676,7 @@ exports.activateCard = async (req, res) => {
 
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
     if (!card)                          return res.status(404).json({ success: false, message: 'Card not found' });
+    if (card.uqpayCardId)               return res.status(400).json({ success: false, message: 'UQPay cards are activated automatically. No manual activation required.' });
     if (card.cardType !== 'physical')   return res.status(400).json({ success: false, message: 'Only physical cards can be activated.' });
     if (card.status === 'active')       return res.status(400).json({ success: false, message: 'This card is already active.' });
     if (card.status === 'cancelled')    return res.status(400).json({ success: false, message: 'Cancelled cards cannot be activated.' });
@@ -697,7 +702,7 @@ exports.activateCard = async (req, res) => {
   }
 };
 
-// ── Update Physical Card PIN ──────────────────────────────────────────────
+// ── Update / Reset PIN ────────────────────────────────────────────────────
 
 exports.updatePin = async (req, res) => {
   try {
@@ -714,17 +719,28 @@ exports.updatePin = async (req, res) => {
     }
 
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!card)                        return res.status(404).json({ success: false, message: 'Card not found' });
-    if (card.cardType !== 'physical') return res.status(400).json({ success: false, message: 'PIN update is only for physical cards.' });
-    if (card.status !== 'active')     return res.status(400).json({ success: false, message: 'PIN can only be updated on an active card.' });
-    if (!card.wasabiCardId)           return res.status(400).json({ success: false, message: 'Card reference not found.' });
+    if (!card)                    return res.status(404).json({ success: false, message: 'Card not found' });
+    if (card.status !== 'active') return res.status(400).json({ success: false, message: 'PIN can only be updated on an active card.' });
 
-    const merchantOrderNo = 'UPN' + String(req.user._id).slice(-8).padStart(8, '0') + Date.now();
-    const wasabi = new WasabiService();
-    const result = await wasabi.updatePhysicalCardPin(card.wasabiCardId, merchantOrderNo, pin);
-
-    if (!result) {
-      return res.status(422).json({ success: false, message: 'PIN update failed: ' + (wasabi.lastError() || 'Please try again or contact support.') });
+    if (card.uqpayCardId) {
+      try {
+        await UqpayService.resetCardPin(card.uqpayCardId, pin);
+      } catch (e) {
+        const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+        return res.status(422).json({ success: false, message: msg || 'PIN reset failed. Please try again.' });
+      }
+    } else if (card.wasabiCardId) {
+      if (card.cardType !== 'physical') {
+        return res.status(400).json({ success: false, message: 'PIN update is only for physical cards.' });
+      }
+      const merchantOrderNo = 'UPN' + String(req.user._id).slice(-8).padStart(8, '0') + Date.now();
+      const wasabi = new WasabiService();
+      const result = await wasabi.updatePhysicalCardPin(card.wasabiCardId, merchantOrderNo, pin);
+      if (!result) {
+        return res.status(422).json({ success: false, message: 'PIN update failed: ' + (wasabi.lastError() || 'Please try again or contact support.') });
+      }
+    } else {
+      return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
     }
 
     res.json({ success: true, message: 'PIN updated successfully.' });

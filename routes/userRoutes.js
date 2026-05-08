@@ -34,7 +34,7 @@ router.delete('/wallet/import/:id',          wallet.deleteImportedWallet);
 
 // Cards — static routes MUST come before /cards/:id
 router.get('/cards',                   card.listCards);
-router.get('/cards/check-holder',      card.checkHolder);   // duplicate email/mobile check
+router.get('/cards/products',          card.getProducts);   // UQPay product list
 router.get('/cards/fees',              card.getCardFees);   // issuance fee summary
 router.post('/cards/apply',            card.applyCard);
 

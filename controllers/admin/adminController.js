@@ -1,4 +1,6 @@
 const jwt = require('jsonwebtoken');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const User = require('../../models/User');
 const Wallet = require('../../models/Wallet');
 const WalletTransaction = require('../../models/WalletTransaction');
@@ -13,6 +15,24 @@ const HotWallet = require('../../models/HotWallet');
 const PhysicalCardNumber = require('../../models/PhysicalCardNumber');
 const WalletServiceLog = require('../../models/WalletServiceLog');
 const Merchant = require('../../models/Merchant');
+
+// ── S3 presigned URL helper ───────────────────────────────────────────────────
+const s3Admin = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId:     process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+async function presignKyc(key) {
+  if (!key) return null;
+  if (key.startsWith('http')) return key;
+  try {
+    const cmd = new GetObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: key });
+    return await getSignedUrl(s3Admin, cmd, { expiresIn: 3600 });
+  } catch { return null; }
+}
 
 // GET /admin/dashboard
 exports.dashboard = async (req, res) => {
@@ -108,8 +128,20 @@ exports.getUser = async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select('-password -twoFactorSecret').populate('merchantId', 'name');
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
     const wallet = await Wallet.findOne({ userId: user._id });
-    res.json({ success: true, user, wallet });
+
+    const obj = user.toObject();
+    const [front, back, selfie] = await Promise.all([
+      presignKyc(obj.kycDocFront),
+      presignKyc(obj.kycDocBack),
+      presignKyc(obj.kycSelfie),
+    ]);
+    obj.kycDocFront = front;
+    obj.kycDocBack  = back;
+    obj.kycSelfie   = selfie;
+
+    res.json({ success: true, user: obj, wallet });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

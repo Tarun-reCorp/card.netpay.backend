@@ -4,6 +4,7 @@ const authCtrl    = require('../controllers/auth/adminAuthController');
 const admin       = require('../controllers/admin/adminController');
 const merchantCtrl= require('../controllers/admin/merchantController');
 const crypto      = require('../controllers/admin/cryptoAdminController');
+const uqpay       = require('../controllers/admin/uqpayController');
 
 // Auth
 router.post('/auth/login', authCtrl.login);
@@ -95,5 +96,19 @@ router.put('/crypto/withdrawals/:id/reject',        crypto.rejectWithdrawal);
 router.get('/crypto/gas-treasury',                  crypto.gasTreasury);
 router.get('/crypto/gas-logs',                      crypto.gasLogs);
 router.get('/crypto/service-logs',                  crypto.walletServiceLogs);
+
+// UQPay
+router.get('/uqpay/products',                  uqpay.listProducts);
+router.get('/uqpay/cardholders/uqpay-list',    uqpay.listCardholdersUQPay);
+router.post('/uqpay/cardholders',              uqpay.createCardholder);
+router.get('/uqpay/cardholders',               uqpay.listCardholders);
+router.get('/uqpay/cardholders/:id',           uqpay.getCardholder);
+router.post('/uqpay/cardholders/:id',          uqpay.updateCardholder);
+router.get('/uqpay/cards/stats',               uqpay.getCardStats);
+router.get('/uqpay/cards/uqpay-list',          uqpay.listCardsUQPay);
+router.post('/uqpay/cards',                    uqpay.createCard);
+router.get('/uqpay/cards',                     uqpay.listCards);
+router.get('/uqpay/cards/:id',                 uqpay.getUqpayCard);
+router.post('/uqpay/cards/:id',                uqpay.updateCard);
 
 module.exports = router;
