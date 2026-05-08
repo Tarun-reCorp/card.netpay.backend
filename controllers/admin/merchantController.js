@@ -7,10 +7,11 @@ const User = require('../../models/User');
 
 function merchantUrls(merchant) {
   const base = (process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173').replace(/\/$/, '');
-  const key = merchant.tag || String(merchant._id);
   return {
-    registerUrl: `${base}/register/${key}`,
-    loginUrl:    `${base}/merchant-login/${key}`,
+    // White-label user portal (handles login + register in one page via /:tag route)
+    portalUrl: merchant.tag ? `${base}/${merchant.tag}` : null,
+    // Merchant staff login (same URL for all merchants)
+    loginUrl:  `${base}/merchant/login`,
   };
 }
 

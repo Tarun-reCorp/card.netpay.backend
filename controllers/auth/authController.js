@@ -39,7 +39,12 @@ exports.getMerchantBrand = async (req, res) => {
     const merchant = await Merchant.findOne({ tag: req.params.tag.toLowerCase(), status: 'active' })
       .select('name tag logo primaryColor secondaryColor titleTag showPoweredBy type');
     if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
-    res.json({ success: true, merchant });
+
+    const data = merchant.toObject();
+    // Whitelabel merchants never show "Powered by NetPay" (mirrors PHP Merchant::showPoweredBy())
+    if (data.type === 'whitelabel') data.showPoweredBy = false;
+
+    res.json({ success: true, merchant: data });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
