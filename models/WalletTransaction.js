@@ -4,7 +4,7 @@ const { Schema } = mongoose;
 const walletTransactionSchema = new Schema({
   userId:         { type: Schema.Types.ObjectId, ref: 'User', required: true },
   walletId:       { type: Schema.Types.ObjectId, ref: 'Wallet', required: true },
-  type:           { type: String, enum: ['deposit', 'withdraw', 'card_issuance', 'card_topup'], required: true },
+  type:           { type: String, enum: ['deposit', 'withdraw', 'card_issuance', 'card_issuance_virtual', 'card_issuance_physical', 'card_topup', 'card_withdraw'], required: true },
   amount:         { type: Number, required: true },
   status:         { type: String, enum: ['pending', 'completed', 'rejected', 'approved', 'processing', 'failed'], default: 'pending' },
   paymentGateway: { type: String, default: null },
