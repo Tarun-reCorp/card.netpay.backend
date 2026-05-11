@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
@@ -126,7 +127,10 @@ exports.loginAsUser = async (req, res) => {
 // GET /admin/users/:id
 exports.getUser = async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).select('-password -twoFactorSecret').populate('merchantId', 'name');
+    const user = await User.findById(req.params.id)
+      .select('-password -twoFactorSecret')
+      .populate('merchantId', 'name')
+      .populate('kycReviewedBy', 'name email');
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
     const wallet = await Wallet.findOne({ userId: user._id });
@@ -170,8 +174,15 @@ exports.unblockUser = async (req, res) => {
 // PUT /admin/users/:id/kyc
 exports.updateKyc = async (req, res) => {
   try {
-    const { kycStatus, kycRejectReason } = req.body;
-    await User.findByIdAndUpdate(req.params.id, { kycStatus, kycRejectReason: kycRejectReason || null });
+    const { kycStatus, kycRejectReason, kycReviewNote } = req.body;
+    const note = kycReviewNote || kycRejectReason || null;
+    await User.findByIdAndUpdate(req.params.id, {
+      kycStatus,
+      kycRejectReason: kycStatus === 'rejected' ? (kycRejectReason || note) : null,
+      kycReviewNote: note,
+      kycReviewedBy: req.admin?._id || null,
+      kycReviewedAt: new Date(),
+    });
     res.json({ success: true, message: `KYC ${kycStatus}` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -179,22 +190,34 @@ exports.updateKyc = async (req, res) => {
 };
 
 // PUT /admin/users/:id/holder-id
-exports.updateHolderId = async (req, res) => {
-  try {
-    const { wasabiHolderId, wasabiPhysicalHolderId } = req.body;
-    await User.findByIdAndUpdate(req.params.id, { wasabiHolderId, wasabiPhysicalHolderId });
-    res.json({ success: true, message: 'Holder IDs updated' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
 // POST /admin/users/:id/add-balance
 exports.addWalletBalance = async (req, res) => {
   try {
-    const { amount, notes } = req.body;
-    const wallet = await Wallet.findOneAndUpdate({ userId: req.params.id }, { $inc: { balance: amount } }, { new: true });
+    const amount = Number(req.body.amount);
+    const notes  = req.body.notes || null;
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Amount must be a positive number' });
+    }
+
+    const wallet = await Wallet.findOneAndUpdate(
+      { userId: req.params.id },
+      { $inc: { balance: amount } },
+      { new: true }
+    );
     if (!wallet) return res.status(404).json({ success: false, message: 'Wallet not found' });
+
+    await WalletTransaction.create({
+      userId        : req.params.id,
+      walletId      : wallet._id,
+      type          : 'card_topup',
+      amount,
+      status        : 'completed',
+      transactionId : 'ADMIN-' + crypto.randomBytes(8).toString('hex').toUpperCase(),
+      notes         : notes || `Manual credit by admin (${req.admin?.email || req.admin?._id || 'system'})`,
+      completedAt   : new Date(),
+    });
+
     res.json({ success: true, message: 'Balance added', newBalance: wallet.balance });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -405,21 +428,41 @@ exports.rejectDeposit = async (req, res) => {
 // GET /admin/withdrawals/stats
 exports.withdrawalStats = async (req, res) => {
   try {
-    const [total, pending, approvedProcessing, completed, rejected, pendingAgg, completedAgg] = await Promise.all([
-      Withdrawal.countDocuments(),
-      Withdrawal.countDocuments({ status: 'pending' }),
-      Withdrawal.countDocuments({ status: { $in: ['approved', 'processing'] } }),
-      Withdrawal.countDocuments({ status: 'completed' }),
-      Withdrawal.countDocuments({ status: { $in: ['rejected', 'failed'] } }),
-      Withdrawal.aggregate([{ $match: { status: 'pending' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Withdrawal.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    const byStatus = await Withdrawal.aggregate([
+      { $group: { _id: '$status', count: { $sum: 1 }, amount: { $sum: '$amount' } } },
     ]);
+
+    const s = {
+      pending:    { count: 0, amount: 0 },
+      approved:   { count: 0, amount: 0 },
+      processing: { count: 0, amount: 0 },
+      completed:  { count: 0, amount: 0 },
+      rejected:   { count: 0, amount: 0 },
+      failed:     { count: 0, amount: 0 },
+    };
+    for (const r of byStatus) if (s[r._id]) s[r._id] = { count: r.count, amount: r.amount };
+
+    // Business treats approved/processing/completed as the same final state
+    const approvedCount  = s.approved.count + s.processing.count + s.completed.count;
+    const approvedAmount = s.approved.amount + s.processing.amount + s.completed.amount;
+    const total = s.pending.count + approvedCount + s.rejected.count + s.failed.count;
 
     res.json({
       success: true,
-      total, pending, approvedProcessing, completed, rejected,
-      pendingAmount:   pendingAgg[0]?.total   || 0,
-      completedAmount: completedAgg[0]?.total  || 0,
+      total,
+      pending:        s.pending.count,
+      approved:       approvedCount,
+      rejected:       s.rejected.count + s.failed.count,
+      pendingAmount:  s.pending.amount,
+      approvedAmount,
+      rejectedAmount: s.rejected.amount + s.failed.amount,
+      // backward-compat aliases (kept for any older UI still consuming them)
+      processing:        0,
+      completed:         approvedCount,
+      processingAmount:  0,
+      completedAmount:   approvedAmount,
+      inFlightAmount:    0,
+      approvedProcessing: approvedCount,
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -447,6 +490,19 @@ exports.listWithdrawals = async (req, res) => {
   }
 };
 
+// Find the WalletTransaction linked to a withdrawal (uses referenceId; falls back to
+// matching by user + type=withdraw + amount + pending for older records without a link).
+async function findWithdrawalTxn(withdrawal) {
+  const byRef = await WalletTransaction.findOne({ referenceId: withdrawal._id.toString(), type: 'withdraw' });
+  if (byRef) return byRef;
+  return WalletTransaction.findOne({
+    userId: withdrawal.userId,
+    type: 'withdraw',
+    amount: withdrawal.amount,
+    status: 'pending',
+  }).sort({ createdAt: -1 });
+}
+
 // PUT /admin/withdrawals/:id/approve
 exports.approveWithdrawal = async (req, res) => {
   try {
@@ -464,7 +520,15 @@ exports.approveWithdrawal = async (req, res) => {
       await Wallet.findOneAndUpdate({ userId: withdrawal.userId }, { $inc: { locked: -withdrawal.amount } });
     }
 
-    res.json({ success: true, message: `Withdrawal of $${withdrawal.amount.toFixed(2)} approved. Queued for on-chain processing.` });
+    const txn = await findWithdrawalTxn(withdrawal);
+    if (txn) {
+      txn.status = 'approved';
+      txn.referenceId = txn.referenceId || withdrawal._id.toString();
+      txn.completedAt = new Date();
+      await txn.save();
+    }
+
+    res.json({ success: true, message: `Withdrawal of $${withdrawal.amount.toFixed(2)} approved.` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -492,12 +556,12 @@ exports.rejectWithdrawal = async (req, res) => {
       );
     }
 
-    // Also update WalletTransaction if one exists
-    if (withdrawal.txHash) {
-      await WalletTransaction.findOneAndUpdate(
-        { userId: withdrawal.userId, type: 'withdrawal', status: 'pending' },
-        { status: 'rejected', notes: 'Rejected by admin. Balance refunded.' },
-      );
+    const txn = await findWithdrawalTxn(withdrawal);
+    if (txn) {
+      txn.status = 'rejected';
+      txn.referenceId = txn.referenceId || withdrawal._id.toString();
+      txn.notes = withdrawal.rejectionReason;
+      await txn.save();
     }
 
     res.json({ success: true, message: `Withdrawal rejected. $${withdrawal.amount.toFixed(2)} USDT refunded.` });

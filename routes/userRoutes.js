@@ -24,6 +24,7 @@ router.get('/wallet',                        wallet.getWallet);
 router.get('/wallet/deposit/coins',          wallet.getSupportedCoins);
 router.post('/wallet/deposit/address',       wallet.getDepositAddress);
 router.post('/wallet/deposit/manual',        wallet.submitManualDeposit);
+router.post('/wallet/deposit/static',        wallet.submitStaticDeposit);
 router.get('/wallet/deposit/status/:txHash', wallet.depositStatus);
 router.get('/wallet/deposits',               wallet.listDeposits);
 router.post('/wallet/withdraw',              wallet.initiateWithdraw);

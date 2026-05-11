@@ -9,7 +9,7 @@ const Merchant = require('../../models/Merchant');
 // POST /auth/register
 exports.register = async (req, res) => {
   try {
-    const { name, email, password, firstName, lastName, birthday, country, phone, areaCode, mobile, town, address, postCode, merchantId, merchantTag } = req.body;
+    const { name, email, password, firstName, lastName, birthday, gender, country, countryName, phone, areaCode, mobile, town, address, postCode, merchantId, merchantTag } = req.body;
 
     const exists = await User.findOne({ email });
     if (exists) return res.status(422).json({ success: false, message: 'Email already registered' });
@@ -22,7 +22,7 @@ exports.register = async (req, res) => {
     }
 
     const hashed = await bcrypt.hash(password, 12);
-    const user = await User.create({ name, email, password: hashed, firstName, lastName, birthday, country, phone, areaCode, mobile, town, address, postCode, merchantId: resolvedMerchantId });
+    const user = await User.create({ name, email, password: hashed, firstName, lastName, birthday, gender, country, countryName, phone, areaCode, mobile, town, address, postCode, merchantId: resolvedMerchantId });
 
     await Wallet.create({ userId: user._id });
 

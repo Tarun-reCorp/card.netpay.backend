@@ -22,7 +22,6 @@ router.get('/users/:id',                      admin.getUser);
 router.put('/users/:id/block',                admin.blockUser);
 router.put('/users/:id/unblock',              admin.unblockUser);
 router.put('/users/:id/kyc',                  admin.updateKyc);
-router.put('/users/:id/holder-id',            admin.updateHolderId);
 router.post('/users/:id/add-balance',         admin.addWalletBalance);
 router.post('/users/:id/login-as',            admin.loginAsUser);
 router.get('/users/:id/commission',           admin.getUserCommission);

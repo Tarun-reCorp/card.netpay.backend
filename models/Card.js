@@ -5,8 +5,6 @@ const cardSchema = new Schema({
   userId:             { type: Schema.Types.ObjectId, ref: 'User', required: true },
   uqpayCardId:        { type: String, default: null },
   uqpayCardholderId:  { type: String, default: null },
-  wasabiHolderId:     { type: String, default: null },
-  wasabiCardId:       { type: String, default: null },
   cardNo:             { type: String, default: null },
   organization:       { type: String, enum: ['MasterCard', 'Visa'], default: 'MasterCard' },
   currency:           { type: String, default: 'USD' },
@@ -23,6 +21,6 @@ const cardSchema = new Schema({
 }, { timestamps: true, collection: 'cards' });
 
 cardSchema.index({ userId: 1 });
-cardSchema.index({ wasabiCardId: 1 });
+cardSchema.index({ uqpayCardId: 1 });
 
 module.exports = mongoose.model('Card', cardSchema);

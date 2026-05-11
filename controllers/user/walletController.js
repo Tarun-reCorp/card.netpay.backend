@@ -103,6 +103,96 @@ exports.submitManualDeposit = async (req, res) => {
   }
 };
 
+// POST /user/wallet/deposit/static — TEST ONLY: instantly credits wallet without crypto.
+// Body: { amount, chain?, note? }
+exports.submitStaticDeposit = async (req, res) => {
+  try {
+    const amount = Number(req.body.amount);
+    const chain  = req.body.chain || 'TEST';
+    const note   = req.body.note  || 'Static test deposit';
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Amount must be a positive number' });
+    }
+
+    let wallet = await Wallet.findOne({ userId: req.user._id });
+    if (!wallet) wallet = await Wallet.create({ userId: req.user._id, balance: 0 });
+
+    // Commission on deposit (optional — uses 'deposit' commission setting if defined)
+    let commSetting = await UserCommissionSetting.findOne({ userId: req.user._id, type: 'deposit' });
+    if (!commSetting) commSetting = await CommissionSetting.findOne({ type: 'deposit' });
+
+    let fee = 0;
+    if (commSetting) {
+      fee = commSetting.rateType === 'percentage'
+        ? Math.round(amount * commSetting.rate / 100 * 100) / 100
+        : commSetting.rate;
+    }
+    const netCredit = Math.max(0, Math.round((amount - fee) * 100) / 100);
+
+    const txId = 'TEST-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+    const txHash = 'TEST-' + crypto.randomBytes(16).toString('hex');
+
+    // Create Deposit FIRST so validation (chain enum, etc.) fails before any wallet mutation.
+    const deposit = await Deposit.create({
+      userId         : req.user._id,
+      chain,
+      asset          : 'USDT',
+      amount         : netCredit,
+      txHash,
+      toAddress      : 'STATIC-TEST',
+      source         : 'manual',
+      status         : 'confirmed',
+      confirmations  : 99,
+      requiredConfs  : 0,
+      verifiedOnChain: false,
+      creditedAt     : new Date(),
+      notes          : note,
+    });
+
+    wallet.balance = Math.round((wallet.balance + netCredit) * 100) / 100;
+    await wallet.save();
+
+    await WalletTransaction.create({
+      userId        : req.user._id,
+      walletId      : wallet._id,
+      type          : 'deposit',
+      amount        : netCredit,
+      status        : 'completed',
+      transactionId : txId,
+      chain,
+      txHash,
+      notes         : note,
+      completedAt   : new Date(),
+    });
+
+    if (commSetting && fee > 0) {
+      await CommissionLedger.create({
+        userId          : req.user._id,
+        transactionId   : txId,
+        type            : 'deposit',
+        grossAmount     : amount,
+        commissionAmount: fee,
+        netAmount       : netCredit,
+        rateType        : commSetting.rateType,
+        rate            : commSetting.rate,
+      });
+    }
+
+    res.json({
+      success     : true,
+      message     : `$${netCredit.toFixed(2)} credited (test deposit).`,
+      depositId   : deposit._id,
+      newBalance  : wallet.balance,
+      grossAmount : amount,
+      fee,
+      netCredit,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // GET /user/wallet/deposit/status/:txHash
 exports.depositStatus = async (req, res) => {
   try {
@@ -167,6 +257,7 @@ exports.initiateWithdraw = async (req, res) => {
       amount,
       status: 'pending',
       transactionId: txId,
+      referenceId: withdrawal._id.toString(),
       chain,
     });
 

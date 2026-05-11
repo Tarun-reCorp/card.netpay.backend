@@ -60,37 +60,22 @@ async function getValidToken() {
 
 // ── Cardholder ────────────────────────────────────────────────────────────────
 
-async function createCardholder({ email, first_name, last_name, country_code, phone_number, date_of_birth, gender, nationality, document_type, document, userId = null, adminId = null }) {
-  const token          = await getValidToken();
-  const idempotencyKey = crypto.randomUUID();
+async function createCardholder(input) {
+  const { userId = null, adminId = null, ...payload } = input;
+  const token = await getValidToken();
 
-  const payload = { email, first_name, last_name, country_code, phone_number };
-  if (date_of_birth)  payload.date_of_birth  = date_of_birth;
-  if (gender)         payload.gender         = gender;
-  if (nationality)    payload.nationality    = nationality;
-  if (document_type)  payload.document_type  = document_type;
-  if (document)       payload.document       = document;
-
-  const response = await axios.post(
+  const { data } = await axios.post(
     `${BASE_URL}/issuing/cardholders`,
     payload,
-    { headers: { ...getApiHeaders(token), 'x-idempotency-key': idempotencyKey } }
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': crypto.randomUUID() } }
   );
 
-  const { cardholder_id, cardholder_status } = response.data;
-
-  const cardholder = await UqpayCardholder.create({
+  return UqpayCardholder.create({
     userId, adminId,
-    cardholder_id, cardholder_status,
-    first_name, last_name, email, country_code, phone_number,
-    date_of_birth: date_of_birth || null,
-    gender:        gender        || null,
-    nationality:   nationality   || null,
-    document_type: document_type || null,
+    cardholder_id: data.cardholder_id,
+    cardholder_status: data.cardholder_status,
+    ...payload,
   });
-
-  console.log(`[UQPay] Cardholder created: ${cardholder_id} (${cardholder_status})`);
-  return cardholder;
 }
 
 async function listCardholdersFromUQPay({ page_size = 10, page_number = 1 } = {}) {
@@ -160,6 +145,10 @@ async function createCard({
   const idempotencyKey = crypto.randomUUID();
 
   const payload = { card_currency, cardholder_id, card_product_id };
+
+console.log("payload" , payload);
+
+
   if (card_limit !== undefined)        payload.card_limit                 = card_limit;
   if (name_on_card)                    payload.name_on_card               = name_on_card;
   if (spending_controls)               payload.spending_controls          = spending_controls;
@@ -169,6 +158,11 @@ async function createCard({
   if (auto_cancel_trigger)             payload.auto_cancel_trigger        = auto_cancel_trigger;
   if (expiry_at)                       payload.expiry_at                  = expiry_at;
   if (cardholder_required_fields)      payload.cardholder_required_fields = cardholder_required_fields;
+
+
+
+  console.log('[UQPay] Creating card with payload:', JSON.stringify(payload));
+
 
   const response = await axios.post(
     `${BASE_URL}/issuing/cards`,
@@ -194,6 +188,47 @@ async function createCard({
 
   console.log(`[UQPay] Card created: ${card_id} (${card_status})`);
   return card;
+}
+
+// Assigns a pre-issued physical card (by card_number) to a cardholder.
+// POST /issuing/cards/assign
+async function assignCard({
+  cardholder_id, card_number, card_currency, card_mode,
+  card_product_id, cardholderId, userId = null, adminId = null,
+}) {
+  const token = await getValidToken();
+
+  const payload = {
+    cardholder_id: String(cardholder_id || '').trim(),
+    card_number  : String(card_number || '').replace(/\D/g, ''),
+    card_currency: String(card_currency || '').trim().toUpperCase(),
+    card_mode    : String(card_mode || '').trim().toUpperCase(),
+  };
+
+  console.log('[UQPay] assignCard payload →', JSON.stringify(payload));
+
+  const { data } = await axios.post(
+    `${BASE_URL}/issuing/cards/assign`,
+    payload,
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': crypto.randomUUID() } }
+  ).catch(err => {
+    console.error('[UQPay] assignCard rejected by provider →',
+      'status=', err.response?.status,
+      'body=', JSON.stringify(err.response?.data));
+    throw err;
+  });
+
+  return UqpayCard.create({
+    cardholderId, userId, adminId,
+    card_order_id : data.card_order_id,
+    card_id       : data.card_id,
+    cardholder_id : data.cardholder_id || cardholder_id,
+    card_status   : data.card_status,
+    order_status  : data.order_status,
+    card_currency,
+    card_product_id: card_product_id || 'physical',
+    create_time   : data.create_time ? new Date(data.create_time) : new Date(),
+  });
 }
 
 async function getCardInfo(card_id) {
@@ -259,6 +294,16 @@ async function getCardOrders(card_id, params = {}) {
   return response.data;
 }
 
+// Pre-settlement authorization records (auth holds before they settle into orders).
+async function getCardAuthorizations(card_id, params = {}) {
+  const token = await getValidToken();
+  const response = await axios.get(
+    `${BASE_URL}/issuing/cards/${card_id}/authorization`,
+    { params, headers: getApiHeaders(token) }
+  );
+  return response.data;
+}
+
 async function resetCardPin(card_id, pin) {
   const token          = await getValidToken();
   const idempotencyKey = crypto.randomUUID();
@@ -291,7 +336,7 @@ async function updateCardStatus(card_id, card_status, update_reason = '') {
   const response = await axios.post(
     `${BASE_URL}/issuing/cards/${card_id}/status`,
     { card_status, update_reason },
-    { headers: getApiHeaders(token) }
+    { headers: { ...getApiHeaders(token), 'x-idempotency-key': crypto.randomUUID() } }
   );
 
   return response.data;
@@ -301,7 +346,7 @@ module.exports = {
   getValidToken,
   createCardholder, listCardholdersFromUQPay, getCardholder, updateCardholder,
   getProducts,
-  createCard, getCardInfo, listCardsFromUQPay, updateCard,
-  rechargeCard, withdrawCard, getCardOrders, resetCardPin,
+  createCard, assignCard, getCardInfo, listCardsFromUQPay, updateCard,
+  rechargeCard, withdrawCard, getCardOrders, getCardAuthorizations, resetCardPin,
   updateCardStatus, getCardSensitiveInfo,
 };

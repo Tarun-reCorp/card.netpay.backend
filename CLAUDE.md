@@ -59,18 +59,19 @@ All routes are mounted under `/api` via `routes/index.js`:
 
 **Crypto Deposits**: 8 chains supported (BEP20, TRC20, ERC20, POLYGON, ARBITRUM, BASE, AVALANCHE, OPTIMISM). `Deposit` records track confirmation count vs `requiredConfs` (default 15). `WalletAddress` stores one pre-generated address per user per chain.
 
-### Wasabi Card Provider
+### UQPay Card Provider
 
-`services/WasabiService.js` wraps all card provider API calls. Uses RSA-SHA256 request signing (`WASABI_API_SECRET` is an RSA private key). Sensitive card data (number, CVV) comes back RSA-encrypted and is decrypted via `decryptRsa()`. Card types are configured via `WASABI_VIRTUAL_CARD_TYPE_ID` / `WASABI_PHYSICAL_CARD_TYPE_ID` env vars.
+`services/UqpayService.js` wraps all card provider API calls. Auth via short-lived `x-auth-token` (cached in `UqpayToken` collection, refreshed via `/connect/token`). Sensitive card data (number, CVV) is retrieved via `getCardSensitiveInfo`. Products and card BINs come from `/issuing/products`.
 
 Key card flow in `controllers/user/cardController.js` (`applyCard`):
-1. Validate complete user profile + KYC status
-2. Resolve physical card number from inventory (if physical)
-3. Deduct wallet balance (deposit amount + fee)
-4. Create `Card` record (status=`processing`)
-5. Call Wasabi `createHolder()` then `createCard()`
-6. Update card with Wasabi IDs (status=`pending`)
-7. Write `CommissionLedger` entry
+1. Validate KYC status, wallet balance, card type
+2. Get-or-create `UqpayCardholder` for this user (`POST /issuing/cardholders`)
+3. If physical: atomically reserve a `PhysicalCardNumber` from inventory (pre-assigned → merchant pool → general pool)
+4. Deduct wallet balance + create local `Card` (status=`processing`) + write `WalletTransaction` + `CommissionLedger`
+5. Call UQPay — virtual: `POST /issuing/cards` (`createCard`); physical: `POST /issuing/cards/assign` (`assignCard`)
+6. On success: update `Card.uqpayCardId`, status=`pending`. On failure: roll back wallet + release physical card to inventory.
+
+Card lifecycle endpoints under `/api/user/cards/*` (and merchant-facing `/api/cards/*` with `X-API-Key`): apply, topup (`rechargeCard`), withdraw (`withdrawCard`), freeze/unfreeze/terminate (`updateCardStatus`), activate (sets PIN via `resetCardPin`), update PIN, reveal (`getCardSensitiveInfo`), transactions (`getCardOrders`).
 
 ### Environment Variables
 
@@ -82,11 +83,9 @@ JWT_SECRET             # User JWT signing key
 JWT_ADMIN_SECRET       # Admin JWT signing key
 JWT_MERCHANT_SECRET    # Merchant JWT signing key
 API_KEY                # X-API-Key for external /api/cards/* routes
-WASABI_API_URL         # Card provider base URL
-WASABI_API_KEY         # Card provider API key
-WASABI_API_SECRET      # RSA private key (PEM) for request signing
-WASABI_VIRTUAL_CARD_TYPE_ID
-WASABI_PHYSICAL_CARD_TYPE_ID
+UQPAY_API_URL          # UQPay base URL (sandbox: https://api-sandbox.uqpaytech.com/api/v1)
+UQPAY_API_KEY          # UQPay API key (for /connect/token)
+UQPAY_CLIENT_ID        # UQPay client id (for /connect/token)
 ENCRYPTION_KEY         # 32-byte hex key for encrypting wallet mnemonics
 ```
 
