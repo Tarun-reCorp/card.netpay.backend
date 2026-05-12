@@ -31,7 +31,11 @@ exports.listPhysicalCards = async (req, res) => {
     const [cards, total] = await Promise.all([
       PhysicalCardNumber.find(filter)
         .populate('preAssignedUserId', 'name email')
-        .populate('cardId', 'status cardNo')
+        .populate({
+          path: 'cardId',
+          select: 'status cardNo userId',
+          populate: { path: 'userId', select: 'name email' },
+        })
         .sort({ isUsed: 1, createdAt: -1 })
         .skip((page - 1) * Number(limit))
         .limit(Number(limit)),

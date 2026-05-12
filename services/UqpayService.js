@@ -294,14 +294,11 @@ async function getCardOrders(card_id, params = {}) {
   return response.data;
 }
 
-// Pre-settlement authorization records (auth holds before they settle into orders).
+// NOTE: UQPay v1.6 does not expose a separate "authorizations" endpoint —
+// authorizations are surfaced via `/issuing/cards/{id}/order` with order_type filter.
+// Kept as a thin alias so existing callers keep compiling.
 async function getCardAuthorizations(card_id, params = {}) {
-  const token = await getValidToken();
-  const response = await axios.get(
-    `${BASE_URL}/issuing/cards/${card_id}/authorization`,
-    { params, headers: getApiHeaders(token) }
-  );
-  return response.data;
+  return getCardOrders(card_id, { ...params, order_type: 'AUTHORIZATION' });
 }
 
 async function resetCardPin(card_id, pin) {

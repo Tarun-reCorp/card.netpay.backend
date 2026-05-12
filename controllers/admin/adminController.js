@@ -763,31 +763,64 @@ exports.listCards = async (req, res) => {
 // GET /admin/physical-card-numbers
 exports.listPhysicalCardNumbers = async (req, res) => {
   try {
-    const { page = 1, limit = 20, isUsed, merchantId } = req.query;
+    const { page = 1, limit = 50, statusFilter, merchantFilter } = req.query;
     const filter = {};
-    if (isUsed !== undefined) filter.isUsed = isUsed === 'true';
-    if (merchantId) filter.merchantId = merchantId;
 
-    const cards = await PhysicalCardNumber.find(filter)
-      .populate('merchantId', 'name')
-      .populate('preAssignedUserId', 'name email')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit));
-    const total = await PhysicalCardNumber.countDocuments(filter);
-    res.json({ success: true, cards, total });
+    if (merchantFilter === 'general')      filter.merchantId = null;
+    else if (merchantFilter)               filter.merchantId = merchantFilter;
+
+    if (statusFilter === 'available')      filter.isUsed = false;
+    else if (statusFilter === 'used')      filter.isUsed = true;
+
+    const [cards, total, stats] = await Promise.all([
+      PhysicalCardNumber.find(filter)
+        .populate('merchantId', 'name')
+        .populate('preAssignedUserId', 'name email')
+        .populate({ path: 'cardId', select: 'status cardNo userId', populate: { path: 'userId', select: 'name email' } })
+        .sort({ isUsed: 1, createdAt: -1 })
+        .skip((page - 1) * Number(limit))
+        .limit(Number(limit)),
+      PhysicalCardNumber.countDocuments(filter),
+      Promise.all([
+        PhysicalCardNumber.countDocuments({}),
+        PhysicalCardNumber.countDocuments({ isUsed: false }),
+        PhysicalCardNumber.countDocuments({ isUsed: true }),
+      ]).then(([t, a, u]) => ({ total: t, available: a, used: u })),
+    ]);
+    res.json({ success: true, cards, total, stats });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
 // POST /admin/physical-card-numbers
+// Accepts: { cardNumbers: "string with newlines/commas/semicolons" | string[], notes?, merchantId? }
 exports.addPhysicalCardNumbers = async (req, res) => {
   try {
-    const { cardNumbers, merchantId } = req.body; // cardNumbers: array of strings
-    const docs = cardNumbers.map(n => ({ cardNumber: n, merchantId: merchantId || null }));
-    await PhysicalCardNumber.insertMany(docs, { ordered: false });
-    res.status(201).json({ success: true, message: `${cardNumbers.length} card numbers added` });
+    const { cardNumbers, notes, merchantId } = req.body;
+    let raw = [];
+    if (Array.isArray(cardNumbers)) raw = cardNumbers;
+    else if (typeof cardNumbers === 'string') raw = cardNumbers.split(/[\r\n,;]+/);
+    else return res.status(400).json({ success: false, message: 'cardNumbers is required' });
+
+    let added = 0, skipped = 0;
+    for (const entry of raw) {
+      const num = String(entry || '').replace(/\s+/g, '').trim();
+      if (!num) continue;
+      if (!/^\d{13,19}$/.test(num)) { skipped++; continue; }
+      const exists = await PhysicalCardNumber.exists({ cardNumber: num });
+      if (exists) { skipped++; continue; }
+      await PhysicalCardNumber.create({
+        cardNumber: num,
+        notes: notes || null,
+        merchantId: merchantId || null,
+      });
+      added++;
+    }
+
+    let message = `${added} card number(s) added.`;
+    if (skipped > 0) message += ` ${skipped} skipped (invalid or duplicate).`;
+    res.status(201).json({ success: true, message, added, skipped });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -796,8 +829,13 @@ exports.addPhysicalCardNumbers = async (req, res) => {
 // DELETE /admin/physical-card-numbers/:id
 exports.deletePhysicalCardNumber = async (req, res) => {
   try {
-    await PhysicalCardNumber.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'Deleted' });
+    const num = await PhysicalCardNumber.findById(req.params.id);
+    if (!num) return res.status(404).json({ success: false, message: 'Card number not found' });
+    if (num.isUsed) {
+      return res.status(400).json({ success: false, message: 'Cannot delete a card number that has already been assigned.' });
+    }
+    await num.deleteOne();
+    res.json({ success: true, message: 'Card number deleted.' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -807,22 +845,119 @@ exports.deletePhysicalCardNumber = async (req, res) => {
 exports.assignCardToMerchant = async (req, res) => {
   try {
     const { merchantId } = req.body;
-    await PhysicalCardNumber.findByIdAndUpdate(req.params.id, { merchantId });
-    res.json({ success: true, message: 'Assigned to merchant' });
+    const num = await PhysicalCardNumber.findById(req.params.id);
+    if (!num) return res.status(404).json({ success: false, message: 'Card number not found' });
+    if (num.isUsed) {
+      return res.status(400).json({ success: false, message: 'Cannot reassign a card number that has already been used.' });
+    }
+    // Clear user pre-assignment whenever the merchant changes (matches PHP behavior).
+    num.merchantId = merchantId || null;
+    num.preAssignedUserId = null;
+    num.preAssignedAt = null;
+    await num.save();
+    res.json({ success: true, message: 'Card assignment updated.' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
 // PUT /admin/physical-card-numbers/:id/pre-assign-user
+// Body: { userId?: string, email?: string }
+// Empty userId+email clears the pre-assignment.
 exports.preAssignUser = async (req, res) => {
   try {
-    const { userId } = req.body;
-    await PhysicalCardNumber.findByIdAndUpdate(req.params.id, { preAssignedUserId: userId, preAssignedAt: new Date() });
-    res.json({ success: true, message: 'Pre-assigned to user' });
+    const { userId, email } = req.body || {};
+    const num = await PhysicalCardNumber.findById(req.params.id);
+    if (!num) return res.status(404).json({ success: false, message: 'Card number not found' });
+    if (num.isUsed) {
+      return res.status(400).json({ success: false, message: 'Card number is already in use.' });
+    }
+
+    if (!userId && !(email && email.trim())) {
+      num.preAssignedUserId = null;
+      num.preAssignedAt = null;
+      await num.save();
+      return res.json({ success: true, message: 'Pre-assignment cleared.', user: null });
+    }
+
+    let user = null;
+    if (userId) user = await User.findById(userId).select('name email');
+    if (!user && email) user = await User.findOne({ email: email.trim() }).select('name email');
+    if (!user) return res.status(404).json({ success: false, message: 'No user found.' });
+
+    num.preAssignedUserId = user._id;
+    num.preAssignedAt = new Date();
+    await num.save();
+
+    res.json({
+      success: true,
+      message: `Card pre-assigned to ${user.name}.`,
+      user: { id: user._id, name: user.name, email: user.email },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
+};
+
+// POST /admin/physical-card-numbers/:id/mark-used
+// Body: { email?: string } — if provided, links to that user's pending physical card.
+exports.markCardNumberUsed = async (req, res) => {
+  try {
+    const num = await PhysicalCardNumber.findById(req.params.id);
+    if (!num) return res.status(404).json({ success: false, message: 'Card number not found' });
+    if (num.isUsed) {
+      return res.status(400).json({ success: false, message: 'Already marked as used.' });
+    }
+
+    const email = String(req.body?.email || '').trim();
+    let cardId = null;
+    let info = null;
+
+    if (email) {
+      const user = await User.findOne({ email }).select('name email');
+      if (!user) return res.status(404).json({ success: false, message: 'No user found with that email.' });
+
+      // Find a physical card for this user: matching card number, or pending/processing with no card number.
+      const card = await Card.findOne({
+        userId: user._id,
+        cardType: 'physical',
+        $or: [
+          { cardNo: num.cardNumber },
+          { status: { $in: ['pending', 'processing'] }, cardNo: { $in: [null, ''] } },
+        ],
+      }).sort({ createdAt: -1 });
+
+      if (card) {
+        if (!card.cardNo) {
+          card.cardNo = num.cardNumber;
+          await card.save();
+        }
+        cardId = card._id;
+      }
+      info = `${user.name} (${user.email})`;
+    }
+
+    num.isUsed = true;
+    num.usedAt = new Date();
+    num.cardId = cardId;
+    await num.save();
+
+    res.json({
+      success: true,
+      message: 'Card number marked as used' + (info ? ` and linked to ${info}` : '') + '.',
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /admin/physical-card-numbers/:id/mark-available
+// PHP returns 403 — used numbers cannot be flipped back to available.
+exports.markCardNumberAvailable = async (req, res) => {
+  res.status(403).json({
+    success: false,
+    message: 'A used card number cannot be marked available again.',
+  });
 };
 
 // GET /admin/wallet-service-logs

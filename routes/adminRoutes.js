@@ -63,6 +63,8 @@ router.post('/physical-card-numbers',                     admin.addPhysicalCardN
 router.delete('/physical-card-numbers/:id',               admin.deletePhysicalCardNumber);
 router.put('/physical-card-numbers/:id/assign-merchant',  admin.assignCardToMerchant);
 router.put('/physical-card-numbers/:id/pre-assign-user',  admin.preAssignUser);
+router.post('/physical-card-numbers/:id/mark-used',       admin.markCardNumberUsed);
+router.post('/physical-card-numbers/:id/mark-available',  admin.markCardNumberAvailable);
 
 // Wallet service logs
 router.get('/wallet-service-logs', admin.walletServiceLogs);

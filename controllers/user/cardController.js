@@ -134,6 +134,44 @@ exports.getCardFees = async (req, res) => {
   }
 };
 
+// ── Physical Card Availability (mirrors PHP merchantHasPhysicalCards) ────
+//
+// Priority for a user:
+//   1) any card pre-assigned to this user (any merchant) → available.
+//   2) if user belongs to a merchant: any unused card in that merchant pool that
+//      is not pre-assigned to anyone else → available; otherwise NOT available.
+//   3) if user has no merchant: any unused card in the general pool (no merchant,
+//      no pre-assignment) → available.
+exports.physicalAvailable = async (req, res) => {
+  try {
+    const user = req.user;
+
+    const hasPreAssigned = await PhysicalCardNumber.exists({
+      preAssignedUserId: user._id,
+      isUsed: false,
+    });
+    if (hasPreAssigned) return res.json({ success: true, available: true, source: 'preassigned' });
+
+    if (user.merchantId) {
+      const hasMerchant = await PhysicalCardNumber.exists({
+        merchantId: user.merchantId,
+        isUsed: false,
+        preAssignedUserId: null,
+      });
+      return res.json({ success: true, available: !!hasMerchant, source: hasMerchant ? 'merchant' : null });
+    }
+
+    const hasGeneral = await PhysicalCardNumber.exists({
+      merchantId: null,
+      isUsed: false,
+      preAssignedUserId: null,
+    });
+    res.json({ success: true, available: !!hasGeneral, source: hasGeneral ? 'general' : null });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // ── List Cards ────────────────────────────────────────────────────────────
 
 exports.listCards = async (req, res) => {
@@ -192,10 +230,23 @@ exports.applyCard = async (req, res) => {
       card_currency   = 'USD',
       card_mode       = 'SINGLE',       // SINGLE | SHARE — required for physical assign
       depositAmount   : depositAmt,
+      delivery,                          // physical card delivery info: { name, address, city, country, postalCode, phone }
     } = req.body;
 
     if (!['virtual', 'physical'].includes(cardType)) {
       return res.status(400).json({ success: false, message: 'Invalid card type.' });
+    }
+
+    if (cardType === 'physical') {
+      const d = delivery || {};
+      const missing = ['name', 'address', 'city', 'country', 'postalCode', 'phone']
+        .filter(k => !d[k] || !String(d[k]).trim());
+      if (missing.length) {
+        return res.status(400).json({
+          success: false,
+          message: 'Missing delivery details: ' + missing.join(', '),
+        });
+      }
     }
 
     if (req.user.kycStatus !== 'approved') {
@@ -263,20 +314,27 @@ exports.applyCard = async (req, res) => {
         const d = new Date(dob);
         if (!isNaN(d)) cardholderPayload.date_of_birth = d.toISOString().slice(0, 10);
       }
-      const genderMap = { male: 'MALE', female: 'FEMALE', other: 'OTHER', m: 'MALE', f: 'FEMALE' };
+      // UQPay accepts only MALE or FEMALE — skip "other" / "prefer-not-to-say" / blank.
+      const genderMap = { male: 'MALE', female: 'FEMALE', m: 'MALE', f: 'FEMALE' };
       const g = (user.gender || '').toString().trim().toLowerCase();
       if (genderMap[g]) cardholderPayload.gender = genderMap[g];
 
-      const docTypeMap = {
+      // UQPay's `identity` object holds the ID document metadata.
+      // (`document_type` and `document` are for the actual file upload — file extension + base64 content —
+      // which we don't have wired yet, so we only send the structured identity fields.)
+      // UQPay's identity.type accepts only PASSPORT or ID_CARD.
+      // National IDs and driver's licenses both map to ID_CARD (closest equivalent).
+      const idTypeMap = {
         passport: 'PASSPORT',
         national_id: 'ID_CARD', id_card: 'ID_CARD', nid: 'ID_CARD',
-        driving_license: 'DRIVER_LICENSE', drivers_license: 'DRIVER_LICENSE',
-        driver_license: 'DRIVER_LICENSE', dl: 'DRIVER_LICENSE',
+        drivers_license: 'ID_CARD', driver_license: 'ID_CARD', dl: 'ID_CARD',
       };
       const dt = (user.kycDocType || '').toString().trim().toLowerCase();
-      if (docTypeMap[dt] && user.kycIdNumber) {
-        cardholderPayload.document_type = docTypeMap[dt];
-        cardholderPayload.document      = String(user.kycIdNumber).trim();
+      if (idTypeMap[dt] && user.kycIdNumber) {
+        cardholderPayload.identity = {
+          type  : idTypeMap[dt],
+          number: String(user.kycIdNumber).trim(),
+        };
       }
 
       console.log('[applyCard] Creating UQPay cardholder with payload:', cardholderPayload);
@@ -335,6 +393,7 @@ exports.applyCard = async (req, res) => {
       balance           : 0,
       depositAmount,
       feeAmount,
+      deliveryInfo      : cardType === 'physical' ? delivery : null,
     });
 
     if (physCard) {
@@ -771,13 +830,13 @@ exports.activateCard = async (req, res) => {
       return res.status(422).json({ success: false, message: msg || 'Card activation failed. Please try again.' });
     }
 
-    // Apply contactless limit if provided
+    // Apply contactless limit if provided.
+    // UQPay's update-card endpoint takes `no_pin_payment_amount` as a top-level number
+    // (NOT nested inside spending_controls — that's only for amount/interval pairs).
     if (noPinAmount !== null) {
       try {
         await UqpayService.updateCard(card.uqpayCardId, {
-          spending_controls: {
-            no_pin_payment_amount: [{ amount: String(noPinAmount), currency: card.currency || 'USD' }],
-          },
+          no_pin_payment_amount: noPinAmount,
         });
       } catch (e) {
         console.error('[activateCard] no_pin_amount update failed:', e.response?.data || e.message);

@@ -37,6 +37,7 @@ router.delete('/wallet/import/:id',          wallet.deleteImportedWallet);
 router.get('/cards',                   card.listCards);
 router.get('/cards/products',          card.getProducts);   // UQPay product list
 router.get('/cards/fees',              card.getCardFees);   // issuance fee summary
+router.get('/cards/physical-available', card.physicalAvailable); // pre-flight check before apply
 router.post('/cards/apply',            card.applyCard);
 
 // Cards — dynamic :id routes
