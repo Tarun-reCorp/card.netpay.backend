@@ -6,7 +6,7 @@ const cardSchema = new Schema({
   uqpayCardId:        { type: String, default: null },
   uqpayCardholderId:  { type: String, default: null },
   cardNo:             { type: String, default: null },
-  organization:       { type: String, enum: ['MasterCard', 'Visa'], default: 'MasterCard' },
+  organization:       { type: String, enum: ['MasterCard', 'Visa', 'UnionPay', 'Amex', 'Discover'], default: null },
   currency:           { type: String, default: 'USD' },
   cardType:           { type: String, enum: ['virtual', 'physical'], default: 'virtual' },
   deliveryInfo:       { type: Schema.Types.Mixed, default: null },

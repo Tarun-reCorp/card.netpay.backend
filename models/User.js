@@ -13,7 +13,7 @@ const userSchema = new Schema({
   twoFactorEnabled:        { type: Boolean, default: false },
   mpin:                    { type: String, default: null },
   referralCode:            { type: String, default: null },
-  kycStatus:               { type: String, enum: ['not_submitted', 'pending', 'approved', 'rejected'], default: 'not_submitted' },
+  kycStatus:               { type: String, enum: ['not_submitted', 'pending', 'in_review', 'approved', 'rejected'], default: 'not_submitted' },
   kycDocType:              { type: String, default: null },
   kycDocFront:             { type: String, default: null },
   kycDocBack:              { type: String, default: null },

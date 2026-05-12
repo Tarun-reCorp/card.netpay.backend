@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const User = require('../../models/User');
@@ -38,14 +39,199 @@ async function presignKyc(key) {
 // GET /admin/dashboard
 exports.dashboard = async (req, res) => {
   try {
-    const [totalUsers, totalCards, totalMerchants, pendingDeposits, pendingWithdrawals] = await Promise.all([
-      User.countDocuments(),
-      Card.countDocuments(),
-      Merchant.countDocuments(),
-      Deposit.countDocuments({ status: 'pending' }),
-      Withdrawal.countDocuments({ status: 'pending' }),
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    const [
+      userAgg,
+      merchantAgg,
+      cardAgg,
+      physPoolAgg,
+      depositAgg,
+      withdrawalAgg,
+      commissionAgg,
+      cardIssuanceFeesAgg,
+      autoDeposits24h,
+      recentUsers,
+      recentTxns,
+      recentCards,
+      recentMerchants,
+    ] = await Promise.all([
+      User.aggregate([{
+        $group: {
+          _id: null,
+          total:            { $sum: 1 },
+          blocked:          { $sum: { $cond: ['$isBlocked', 1, 0] } },
+          kycApproved:      { $sum: { $cond: [{ $eq: ['$kycStatus', 'approved'] }, 1, 0] } },
+          kycPending:       { $sum: { $cond: [{ $in: ['$kycStatus', ['pending', 'in_review']] }, 1, 0] } },
+          kycInReview:      { $sum: { $cond: [{ $eq: ['$kycStatus', 'in_review'] }, 1, 0] } },
+          kycRejected:      { $sum: { $cond: [{ $eq: ['$kycStatus', 'rejected'] }, 1, 0] } },
+          kycNotSubmitted:  { $sum: { $cond: [{ $eq: ['$kycStatus', 'not_submitted'] }, 1, 0] } },
+          today:            { $sum: { $cond: [{ $gte: ['$createdAt', todayStart] }, 1, 0] } },
+        },
+      }]),
+      Merchant.aggregate([{
+        $group: {
+          _id: null,
+          total:      { $sum: 1 },
+          active:     { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+          inactive:   { $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] } },
+          whitelabel: { $sum: { $cond: [{ $eq: ['$type', 'whitelabel'] }, 1, 0] } },
+        },
+      }]),
+      Card.aggregate([{
+        $group: {
+          _id: null,
+          total:         { $sum: 1 },
+          active:        { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+          frozen:        { $sum: { $cond: [{ $eq: ['$status', 'frozen'] }, 1, 0] } },
+          cancelled:     { $sum: { $cond: [{ $eq: ['$status', 'cancelled'] }, 1, 0] } },
+          other:         { $sum: { $cond: [{ $in: ['$status', ['pending', 'processing', 'failed']] }, 1, 0] } },
+          virtualCount:  { $sum: { $cond: [{ $eq: ['$cardType', 'virtual'] }, 1, 0] } },
+          physicalCount: { $sum: { $cond: [{ $eq: ['$cardType', 'physical'] }, 1, 0] } },
+          totalBalance:  { $sum: '$balance' },
+        },
+      }]),
+      PhysicalCardNumber.aggregate([{
+        $group: {
+          _id: null,
+          total:       { $sum: 1 },
+          used:        { $sum: { $cond: ['$isUsed', 1, 0] } },
+          available:   { $sum: { $cond: ['$isUsed', 0, 1] } },
+          preAssigned: { $sum: { $cond: [{ $and: [{ $ne: ['$preAssignedUserId', null] }, { $eq: ['$isUsed', false] }] }, 1, 0] } },
+        },
+      }]),
+      WalletTransaction.aggregate([
+        { $match: { type: 'deposit' } },
+        {
+          $group: {
+            _id: null,
+            total:        { $sum: 1 },
+            completed:    { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+            pending:      { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+            rejected:     { $sum: { $cond: [{ $eq: ['$status', 'rejected'] }, 1, 0] } },
+            totalAmount:  { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, '$amount', 0] } },
+            manualCount:  { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'completed'] }, { $regexMatch: { input: '$transactionId', regex: /^ADMIN-/i } }] }, 1, 0] } },
+            manualAmount: { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'completed'] }, { $regexMatch: { input: '$transactionId', regex: /^ADMIN-/i } }] }, '$amount', 0] } },
+            autoCount:    { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'completed'] }, { $not: { $regexMatch: { input: '$transactionId', regex: /^ADMIN-/i } } }] }, 1, 0] } },
+            autoAmount:   { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'completed'] }, { $not: { $regexMatch: { input: '$transactionId', regex: /^ADMIN-/i } } }] }, '$amount', 0] } },
+            todayCount:   { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'completed'] }, { $gte: ['$completedAt', todayStart] }] }, 1, 0] } },
+            todayAmount:  { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'completed'] }, { $gte: ['$completedAt', todayStart] }] }, '$amount', 0] } },
+          },
+        },
+      ]),
+      Withdrawal.aggregate([{
+        $group: {
+          _id: null,
+          total:       { $sum: 1 },
+          pending:     { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+          completed:   { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+          rejected:    { $sum: { $cond: [{ $eq: ['$status', 'rejected'] }, 1, 0] } },
+          totalAmount: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, '$amount', 0] } },
+        },
+      }]),
+      CommissionLedger.aggregate([{
+        $group: {
+          _id: null,
+          totalEarned:       { $sum: '$commissionAmount' },
+          depositCommission: { $sum: { $cond: [{ $eq: ['$type', 'deposit'] }, '$commissionAmount', 0] } },
+          cardCommission:    { $sum: { $cond: [{ $in: ['$type', ['card_issuance', 'card_issuance_virtual', 'card_issuance_physical']] }, '$commissionAmount', 0] } },
+          count:             { $sum: 1 },
+        },
+      }]),
+      WalletTransaction.aggregate([
+        { $match: { type: { $in: ['card_issuance', 'card_issuance_virtual', 'card_issuance_physical'] }, status: 'completed' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]),
+      Deposit.countDocuments({ createdAt: { $gte: dayAgo } }),
+      User.find().sort({ createdAt: -1 }).limit(6).select('firstName lastName name email kycStatus isBlocked merchantId createdAt').populate('merchantId', 'name').lean(),
+      WalletTransaction.find().sort({ createdAt: -1 }).limit(6).populate('userId', 'email firstName lastName name').lean(),
+      Card.find().sort({ createdAt: -1 }).limit(5).populate('userId', 'firstName lastName name email').lean(),
+      Merchant.find().sort({ createdAt: -1 }).limit(4).select('name email status type').lean(),
     ]);
-    res.json({ success: true, stats: { totalUsers, totalCards, totalMerchants, pendingDeposits, pendingWithdrawals } });
+
+    const u = userAgg[0] || {};
+    const m = merchantAgg[0] || {};
+    const c = cardAgg[0] || {};
+    const p = physPoolAgg[0] || {};
+    const d = depositAgg[0] || {};
+    const w = withdrawalAgg[0] || {};
+    const com = commissionAgg[0] || {};
+
+    res.json({
+      success: true,
+      stats: {
+        totalUsers:         u.total       || 0,
+        totalCards:         c.total       || 0,
+        totalMerchants:     m.total       || 0,
+        pendingDeposits:    d.pending     || 0,
+        pendingWithdrawals: w.pending     || 0,
+      },
+      userStats: {
+        total:           u.total           || 0,
+        blocked:         u.blocked         || 0,
+        kycApproved:     u.kycApproved     || 0,
+        kycPending:      u.kycPending      || 0,
+        kycInReview:     u.kycInReview     || 0,
+        kycRejected:     u.kycRejected     || 0,
+        kycNotSubmitted: u.kycNotSubmitted || 0,
+        today:           u.today           || 0,
+      },
+      merchantStats: {
+        total:      m.total      || 0,
+        active:     m.active     || 0,
+        inactive:   m.inactive   || 0,
+        whitelabel: m.whitelabel || 0,
+      },
+      cardStats: {
+        total:         c.total         || 0,
+        active:        c.active        || 0,
+        frozen:        c.frozen        || 0,
+        cancelled:     c.cancelled     || 0,
+        other:         c.other         || 0,
+        virtualCount:  c.virtualCount  || 0,
+        physicalCount: c.physicalCount || 0,
+        totalBalance:  c.totalBalance  || 0,
+      },
+      physPool: {
+        total:       p.total       || 0,
+        used:        p.used        || 0,
+        available:   p.available   || 0,
+        preAssigned: p.preAssigned || 0,
+      },
+      depositStats: {
+        total:        d.total        || 0,
+        completed:    d.completed    || 0,
+        pending:      d.pending      || 0,
+        rejected:     d.rejected     || 0,
+        totalAmount:  d.totalAmount  || 0,
+        manualCount:  d.manualCount  || 0,
+        manualAmount: d.manualAmount || 0,
+        autoCount:    d.autoCount    || 0,
+        autoAmount:   d.autoAmount   || 0,
+        todayCount:   d.todayCount   || 0,
+        todayAmount:  d.todayAmount  || 0,
+      },
+      withdrawalStats: {
+        total:       w.total       || 0,
+        pending:     w.pending     || 0,
+        completed:   w.completed   || 0,
+        rejected:    w.rejected    || 0,
+        totalAmount: w.totalAmount || 0,
+      },
+      commissionStats: {
+        totalEarned:       com.totalEarned       || 0,
+        depositCommission: com.depositCommission || 0,
+        cardCommission:    com.cardCommission    || 0,
+        count:             com.count             || 0,
+      },
+      cardIssuanceFees: cardIssuanceFeesAgg[0]?.total || 0,
+      autoDeposits24h,
+      recentUsers,
+      recentTxns,
+      recentCards,
+      recentMerchants,
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -79,20 +265,83 @@ exports.userStats = async (req, res) => {
 // GET /admin/users
 exports.listUsers = async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, kycStatus, status, merchantId } = req.query;
+    const {
+      page         = 1,
+      limit        = 20,
+      search,
+      kycStatus,
+      status,
+      merchantId,
+      twoFactor,        // 'on' | 'off' — filter by 2FA state
+      country,          // ISO2 (e.g. 'IN')
+      dateFrom,         // ISO date string — joined >= dateFrom
+      dateTo,           // ISO date string — joined <= dateTo
+    } = req.query;
+
     const filter = {};
-    if (search) filter.$or = [{ name: new RegExp(search, 'i') }, { email: new RegExp(search, 'i') }];
+
+    // Search across more fields — name, firstName, lastName, email, phone, mobile, country
+    if (search && String(search).trim()) {
+      const q = String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(q, 'i');
+      filter.$or = [
+        { name:        re },
+        { firstName:   re },
+        { lastName:    re },
+        { email:       re },
+        { phone:       re },
+        { mobile:      re },
+        { country:     re },
+        { countryName: re },
+      ];
+    }
+
+    // KYC status — pass through (in_review supported once schema enum allows it)
     if (kycStatus) filter.kycStatus = kycStatus;
+
+    // Block / active state
     if (status === 'blocked') filter.isBlocked = true;
-    if (status === 'active') filter.isBlocked = false;
-    if (merchantId) filter.merchantId = merchantId;
+    else if (status === 'active') filter.isBlocked = false;
+
+    // Merchant filter — accept 'none' for null, otherwise valid ObjectId
+    if (merchantId) {
+      if (merchantId === 'none' || merchantId === 'null') {
+        filter.merchantId = null;
+      } else if (mongoose.Types.ObjectId.isValid(merchantId)) {
+        filter.merchantId = new mongoose.Types.ObjectId(merchantId);
+      }
+      // else: invalid id → silently ignore so the page still loads
+    }
+
+    // 2FA on/off
+    if (twoFactor === 'on')  filter.twoFactorEnabled = true;
+    if (twoFactor === 'off') filter.twoFactorEnabled = false;
+
+    // Country (ISO2 exact match, case-insensitive)
+    if (country && String(country).trim()) {
+      filter.country = new RegExp(`^${String(country).trim()}$`, 'i');
+    }
+
+    // Joined date range
+    if (dateFrom || dateTo) {
+      filter.createdAt = {};
+      if (dateFrom) filter.createdAt.$gte = new Date(dateFrom);
+      if (dateTo) {
+        const end = new Date(dateTo);
+        end.setHours(23, 59, 59, 999);
+        filter.createdAt.$lte = end;
+      }
+    }
+
+    const pageNum  = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 20));
 
     const [users, total] = await Promise.all([
       User.find(filter).select('-password -twoFactorSecret')
         .populate('merchantId', 'name')
         .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(Number(limit)),
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum),
       User.countDocuments(filter),
     ]);
 
@@ -106,8 +355,9 @@ exports.listUsers = async (req, res) => {
       walletBalance: walletMap[u._id.toString()] ?? 0,
     }));
 
-    res.json({ success: true, users: enriched, total });
+    res.json({ success: true, users: enriched, total, page: pageNum, limit: limitNum });
   } catch (err) {
+    console.error('[listUsers] error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 };
