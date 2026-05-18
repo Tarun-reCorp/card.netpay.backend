@@ -181,8 +181,13 @@ async function createWithdraw({ referenceId, paymentMethodId, amount, toAddress 
     data = res.data;
   } catch (err) { rethrow(err, 'withdraw'); }
   ensureSuccess(data, 'withdraw');
+  // Cryptrum's docs show the create response as "6971bf7f9f780." (trailing
+  // dot/whitespace) but /withdraw-list returns it without. Normalize so the
+  // saved code matches what we'll later filter on.
+  const raw = data.withdraw_code;
+  const code = raw == null ? null : String(raw).trim().replace(/[.\s]+$/, '');
   return {
-    withdrawCode: data.withdraw_code,
+    withdrawCode: code,
     message:      data.msg,
   };
 }

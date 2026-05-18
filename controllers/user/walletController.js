@@ -227,22 +227,25 @@ exports.checkDeposits = async (req, res) => {
 // (we use Mongo Withdrawal._id as reference_id when pushing to Cryptrum).
 exports.cryptrumWithdrawals = async (req, res) => {
   try {
-    // Fetch this user's withdrawal codes from local DB, then ask Cryptrum
-    // for each. Avoids leaking other users' codes if Cryptrum doesn't scope
-    // /withdraw-list per app caller — we filter on our side.
+    // Each Mongo Withdrawal._id is sent to Cryptrum as `reference_id`. Filter
+    // /withdraw-list with our reference_id pattern is not supported per-row,
+    // so we pull our local set and intersect against Cryptrum's full list.
     const userWithdrawals = await Withdrawal.find({
       userId: req.user._id,
       cryptrumCode: { $ne: null },
-    }).select('cryptrumCode');
-    const codes = userWithdrawals.map(w => w.cryptrumCode);
-    if (codes.length === 0) return res.json({ success: true, withdrawals: [], pagination: null });
+    }).select('cryptrumCode _id').lean();
+    if (userWithdrawals.length === 0) {
+      return res.json({ success: true, withdrawals: [], pagination: null });
+    }
+    const mineByCode = new Map();
+    for (const w of userWithdrawals) mineByCode.set(w.cryptrumCode, w);
 
-    // Cryptrum's /withdraw-list supports filtering by `code` — fetch each code
-    // individually (the list is small, normally just the user's own history).
-    const results = await Promise.all(codes.map(code =>
-      cryptrum.getWithdrawList({ code }).then(r => r.withdrawals[0]).catch(() => null)
-    ));
-    res.json({ success: true, withdrawals: results.filter(Boolean) });
+    const page = Number(req.query.page) || 1;
+    const { withdrawals, pagination } = await cryptrum.getWithdrawList({ page });
+
+    // Filter on our side so other users' codes never leak through.
+    const mine = withdrawals.filter(w => mineByCode.has(w.code));
+    res.json({ success: true, withdrawals: mine, pagination });
   } catch (err) {
     console.error('[Cryptrum]', req.originalUrl, err.message);
     res.status(err.status || 502).json({ success: false, message: err.message || 'Failed to load withdrawals' });
@@ -579,6 +582,69 @@ exports.initiateWithdraw = async (req, res) => {
     res.json({ success: true, message: 'Withdrawal request submitted', withdrawalId: withdrawal._id });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// POST /user/wallet/withdraw/refresh-status
+//
+// For each of this user's withdrawals that has been pushed to Cryptrum
+// (status=approved/processing, cryptrumCode set), query /withdraw-list and
+// transition the local row to `completed` when Cryptrum reports status=1.
+//
+// Race-safe — the local Withdrawal update uses a precondition
+// (`status: { $ne: 'completed' }`) so two parallel callers can't both
+// flip the row to completed. The WalletTransaction `$set` is idempotent.
+// Locked funds were already released at approval time, so no wallet
+// mutation is required on the completion transition.
+exports.refreshWithdrawalStatus = async (req, res) => {
+  try {
+    const withdrawals = await Withdrawal.find({
+      userId:       req.user._id,
+      cryptrumCode: { $ne: null },
+      status:       { $in: ['approved', 'processing'] },  // non-terminal
+    }).select('cryptrumCode status amount');
+
+    const updated = [];
+
+    for (const w of withdrawals) {
+      let cryptrumData;
+      try {
+        cryptrumData = await cryptrum.getWithdrawList({ code: w.cryptrumCode });
+      } catch (e) {
+        // Skip on transient upstream error — caller can retry.
+        console.error('[refreshWithdrawalStatus]', w.cryptrumCode, e.message);
+        continue;
+      }
+
+      const item = (cryptrumData.withdrawals || [])[0];
+      if (!item) continue;
+
+      // Cryptrum: status=1 means processed/sent. thash_verify=1 means we
+      // also have an on-chain hash confirmed. Treat status=1 as final.
+      if (Number(item.status) === 1) {
+        const txHash = item.txHash || null;
+
+        // Idempotent state transition — only the call that flips
+        // pending→completed gets the row; others get null.
+        const w2 = await Withdrawal.findOneAndUpdate(
+          { _id: w._id, status: { $ne: 'completed' } },
+          { $set: { status: 'completed', txHash, processedAt: new Date() } },
+          { new: true },
+        );
+        if (w2) {
+          await WalletTransaction.findOneAndUpdate(
+            { referenceId: w._id.toString() },
+            { $set: { status: 'completed', txHash, completedAt: new Date() } },
+          );
+          updated.push({ id: String(w._id), status: 'completed', txHash });
+        }
+      }
+    }
+
+    res.json({ success: true, checked: withdrawals.length, updated });
+  } catch (err) {
+    console.error('[500]', req.originalUrl, err);
+    res.status(500).json({ success: false, message: 'Failed to refresh withdrawal status' });
   }
 };
 
