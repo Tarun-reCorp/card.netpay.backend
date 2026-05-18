@@ -7,6 +7,7 @@ const GasTreasury   = require('../../models/GasTreasury');
 const GasLog        = require('../../models/GasLog');
 const WalletServiceLog = require('../../models/WalletServiceLog');
 const Wallet        = require('../../models/Wallet');
+const { WITHDRAWAL_STATUS } = require('../../config/statuses');
 
 const CHAIN_META = {
   BEP20:     { name: 'BNB Smart Chain (BEP20)', native: 'BNB',  explorer: 'https://bscscan.com/tx/' },
@@ -69,7 +70,7 @@ exports.dashboard = async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -87,7 +88,7 @@ exports.toggleChain = async (req, res) => {
     await chain.save();
     res.json({ success: true, chain });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -97,7 +98,7 @@ exports.listHotWallets = async (req, res) => {
     const wallets = await HotWallet.find().sort({ derivationIndex: 1 });
     res.json({ success: true, wallets });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -110,7 +111,7 @@ exports.toggleHotWallet = async (req, res) => {
     await wallet.save();
     res.json({ success: true, wallet });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -122,7 +123,7 @@ exports.listAdminWallets = async (req, res) => {
       .sort({ createdAt: -1 });
     res.json({ success: true, wallets });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -150,7 +151,7 @@ exports.createAdminWallet = async (req, res) => {
       wallet: { id: wallet._id, label: wallet.label, evmAddress: wallet.evmAddress },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -166,7 +167,7 @@ exports.updateAdminWallet = async (req, res) => {
     if (!wallet) return res.status(404).json({ success: false, message: 'Not found' });
     res.json({ success: true, wallet });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -176,7 +177,7 @@ exports.deleteAdminWallet = async (req, res) => {
     await AdminWallet.findByIdAndDelete(req.params.id);
     res.json({ success: true, message: 'Admin wallet deleted' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -198,7 +199,7 @@ exports.listDeposits = async (req, res) => {
     ]);
     res.json({ success: true, deposits, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -221,48 +222,70 @@ exports.listWithdrawals = async (req, res) => {
     ]);
     res.json({ success: true, withdrawals, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // PUT /admin/crypto/withdrawals/:id/approve
 exports.approveWithdrawal = async (req, res) => {
   try {
-    const withdrawal = await Withdrawal.findById(req.params.id);
-    if (!withdrawal) return res.status(404).json({ success: false, message: 'Not found' });
-    if (withdrawal.status !== 'pending')
-      return res.status(400).json({ success: false, message: `Cannot approve — status is ${withdrawal.status}` });
-
-    withdrawal.status = 'approved';
-    withdrawal.approvedBy = req.admin._id;
-    await withdrawal.save();
+    // Atomic pending → approved. Mirrors adminController.approveWithdrawal so
+    // both routes are safe under concurrent admin clicks across either UI.
+    const withdrawal = await Withdrawal.findOneAndUpdate(
+      { _id: req.params.id, status: WITHDRAWAL_STATUS.PENDING },
+      { $set: { status: WITHDRAWAL_STATUS.APPROVED, approvedBy: req.admin._id } },
+      { new: true },
+    );
+    if (!withdrawal) {
+      const exists = await Withdrawal.exists({ _id: req.params.id });
+      if (!exists) return res.status(404).json({ success: false, message: 'Not found' });
+      return res.status(409).json({ success: false, message: 'Withdrawal already actioned' });
+    }
     res.json({ success: true, message: 'Withdrawal approved — will be processed by wallet service' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // PUT /admin/crypto/withdrawals/:id/reject
+// Restricted to PENDING state only — once a withdrawal is approved, funds may
+// already be moving on-chain and refunding the wallet here would double-pay
+// the user. Approved/processing rows must be reconciled via a separate
+// reversal flow, never via this endpoint.
 exports.rejectWithdrawal = async (req, res) => {
   try {
     const { reason } = req.body;
-    const withdrawal = await Withdrawal.findById(req.params.id);
-    if (!withdrawal) return res.status(404).json({ success: false, message: 'Not found' });
-    if (!['pending', 'approved'].includes(withdrawal.status))
-      return res.status(400).json({ success: false, message: `Cannot reject — status is ${withdrawal.status}` });
 
-    withdrawal.status = 'rejected';
-    withdrawal.rejectionReason = reason || 'Rejected by admin';
-    await withdrawal.save();
-
-    // Refund locked funds back to wallet balance
-    await Wallet.findOneAndUpdate(
-      { userId: withdrawal.userId },
-      { $inc: { balance: withdrawal.amount, locked: -withdrawal.amount } },
+    const withdrawal = await Withdrawal.findOneAndUpdate(
+      { _id: req.params.id, status: WITHDRAWAL_STATUS.PENDING },
+      {
+        $set: {
+          status: WITHDRAWAL_STATUS.REJECTED,
+          rejectionReason: reason || 'Rejected by admin',
+        },
+      },
+      { new: true },
     );
+    if (!withdrawal) {
+      const exists = await Withdrawal.exists({ _id: req.params.id });
+      if (!exists) return res.status(404).json({ success: false, message: 'Not found' });
+      return res.status(409).json({ success: false, message: 'Only pending withdrawals can be rejected' });
+    }
+
+    // Refund locked funds back to wallet balance. Lock decrement is guarded
+    // by Math.min so it can never push `locked` negative for partial-lock rows.
+    const wallet = await Wallet.findOne({ userId: withdrawal.userId });
+    if (wallet) {
+      const lockedDec = Math.min(wallet.locked, withdrawal.amount);
+      await Wallet.findOneAndUpdate(
+        { userId: withdrawal.userId },
+        { $inc: { balance: withdrawal.amount, locked: -lockedDec } },
+      );
+    }
+
     res.json({ success: true, message: 'Withdrawal rejected and funds refunded to user wallet' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -272,7 +295,7 @@ exports.gasTreasury = async (req, res) => {
     const treasury = await GasTreasury.find().sort({ chain: 1 });
     res.json({ success: true, treasury });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -289,7 +312,7 @@ exports.gasLogs = async (req, res) => {
     ]);
     res.json({ success: true, logs, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -308,6 +331,6 @@ exports.walletServiceLogs = async (req, res) => {
     ]);
     res.json({ success: true, logs, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

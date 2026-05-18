@@ -1,5 +1,19 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
+const { KYC_STATUS, KYC_STATUS_VALUES } = require('../config/statuses');
+
+// Cached Cryptrum-issued deposit addresses, one per (asset × network).
+// Keyed by Cryptrum's payment_method_id so re-selecting the same network
+// reuses the existing address instead of minting a new one.
+const cryptoAddressSchema = new Schema({
+  paymentMethodId: { type: Number, required: true },
+  address:         { type: String, required: true },
+  name:            { type: String, default: null },  // e.g. "USDT"
+  networkName:     { type: String, default: null },  // e.g. "BEP20"
+  networkType:     { type: String, default: null },  // e.g. "EVM"
+  chainId:         { type: Number, default: null },
+  createdAt:       { type: Date, default: Date.now },
+}, { _id: false });
 
 const userSchema = new Schema({
   merchantId:              { type: Schema.Types.ObjectId, ref: 'Merchant', default: null },
@@ -11,9 +25,10 @@ const userSchema = new Schema({
   password:                { type: String, required: true },
   twoFactorSecret:         { type: String, default: null },
   twoFactorEnabled:        { type: Boolean, default: false },
+  twoFactorRequired:       { type: Boolean, default: false },
   mpin:                    { type: String, default: null },
   referralCode:            { type: String, default: null },
-  kycStatus:               { type: String, enum: ['not_submitted', 'pending', 'in_review', 'approved', 'rejected'], default: 'not_submitted' },
+  kycStatus:               { type: String, enum: KYC_STATUS_VALUES, default: KYC_STATUS.NOT_SUBMITTED },
   kycDocType:              { type: String, default: null },
   kycDocFront:             { type: String, default: null },
   kycDocBack:              { type: String, default: null },
@@ -39,6 +54,7 @@ const userSchema = new Schema({
   town:                    { type: String, default: null },
   address:                 { type: String, default: null },
   postCode:                { type: String, default: null },
+  cryptoAddresses:         { type: [cryptoAddressSchema], default: [] },
 }, { timestamps: true, collection: 'users' });
 
 userSchema.index({ email: 1 });

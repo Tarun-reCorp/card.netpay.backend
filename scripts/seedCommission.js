@@ -8,6 +8,8 @@ const AppSetting = require('../models/AppSetting');
 const defaults = [
   { type: 'card_issuance_virtual',  rateType: 'fixed',      rate: 10   },
   { type: 'card_issuance_physical', rateType: 'fixed',      rate: 50   },
+  { type: 'card_deposit',           rateType: 'percentage', rate: 0    },
+  { type: 'card_withdrawal',        rateType: 'percentage', rate: 0    },
   { type: 'deposit',                rateType: 'percentage', rate: 1.75 },
   { type: 'withdrawal',             rateType: 'percentage', rate: 1    },
 ];

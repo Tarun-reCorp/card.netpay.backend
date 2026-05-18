@@ -150,7 +150,8 @@ mongoose.connect(process.env.MONGO_URI).then(async () => {
   const commDefaults = [
     { type: 'card_issuance_virtual',  rateType: 'fixed',      rate: 10   },
     { type: 'card_issuance_physical', rateType: 'fixed',      rate: 50   },
-    { type: 'card_topup',             rateType: 'percentage', rate: 0.5  },
+    { type: 'card_deposit',           rateType: 'percentage', rate: 0    },
+    { type: 'card_withdrawal',        rateType: 'percentage', rate: 0    },
     { type: 'deposit',                rateType: 'percentage', rate: 1.75 },
     { type: 'withdrawal',             rateType: 'percentage', rate: 1    },
   ];
@@ -176,7 +177,7 @@ mongoose.connect(process.env.MONGO_URI).then(async () => {
         { userId: alice._id, transactionId: 'CARD-001', type: 'card_issuance_virtual',  grossAmount: 60,   commissionAmount: 10,    netAmount: 50,     rateType: 'fixed',      rate: 10 },
         { userId: bob._id,   transactionId: 'CARD-002', type: 'card_issuance_physical', grossAmount: 150,  commissionAmount: 50,    netAmount: 100,    rateType: 'fixed',      rate: 50 },
         { userId: alice._id, transactionId: 'WD-001',   type: 'withdrawal',             grossAmount: 1000, commissionAmount: 10,    netAmount: 990,    rateType: 'percentage', rate: 1 },
-        { userId: bob._id,   transactionId: 'TOPUP-001',type: 'card_topup',             grossAmount: 700,  commissionAmount: 3.5,   netAmount: 696.5,  rateType: 'percentage', rate: 0.5 },
+        { userId: bob._id,   transactionId: 'CDEP-001', type: 'card_deposit',           grossAmount: 700,  commissionAmount: 3.5,   netAmount: 696.5,  rateType: 'percentage', rate: 0.5 },
       ]);
       console.log('CommissionLedger seeded: 6 records');
     } else {

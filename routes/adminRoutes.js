@@ -1,13 +1,18 @@
 const router = require('express').Router();
 const adminAuth   = require('../middleware/adminAuthMiddleware');
+const requireRole = require('../middleware/requireRole');
 const authCtrl    = require('../controllers/auth/adminAuthController');
 const admin       = require('../controllers/admin/adminController');
 const merchantCtrl= require('../controllers/admin/merchantController');
 const crypto      = require('../controllers/admin/cryptoAdminController');
 const uqpay       = require('../controllers/admin/uqpayController');
+const { loginLimiter, twoFactorLimiter } = require('../middleware/rateLimiters');
 
-// Auth
-router.post('/auth/login', authCtrl.login);
+// Auth (public — 2FA endpoints are challenge-bound by mfaChallengeToken / setupToken)
+router.post('/auth/login',      loginLimiter,     authCtrl.login);
+router.post('/auth/2fa/verify', twoFactorLimiter, authCtrl.verify2FA);
+router.post('/auth/2fa/setup',  twoFactorLimiter, authCtrl.setup2FA);
+router.post('/auth/2fa/enable', twoFactorLimiter, authCtrl.enable2FA);
 
 // All routes below require admin token
 router.use(adminAuth);
@@ -19,13 +24,20 @@ router.get('/dashboard', admin.dashboard);
 router.get('/users/stats',                    admin.userStats);
 router.get('/users',                          admin.listUsers);
 router.get('/users/:id',                      admin.getUser);
+router.put('/users/:id',                      admin.updateUser);
 router.put('/users/:id/block',                admin.blockUser);
 router.put('/users/:id/unblock',              admin.unblockUser);
+router.put('/users/:id/2fa',                  admin.toggleUser2FA);
 router.put('/users/:id/kyc',                  admin.updateKyc);
-router.post('/users/:id/add-balance',         admin.addWalletBalance);
-router.post('/users/:id/login-as',            admin.loginAsUser);
+router.post('/users/:id/add-balance',         requireRole('ops'),   admin.addWalletBalance);
+router.post('/users/:id/login-as',            requireRole(),        admin.loginAsUser);          // super-only
 router.get('/users/:id/commission',           admin.getUserCommission);
-router.put('/users/:id/commission',           admin.updateUserCommission);
+router.put('/users/:id/commission',           requireRole('ops'),   admin.updateUserCommission);
+router.get('/users/:id/crypto-addresses',     admin.listUserCryptoAddresses);
+router.post('/users/:id/crypto-addresses',    requireRole('ops'),   admin.createUserCryptoAddress);
+
+// Cryptrum passthroughs
+router.get('/cryptrum/payment-methods',       admin.cryptrumPaymentMethods);
 
 // Transactions
 router.get('/transactions/stats', admin.transactionStats);
@@ -34,19 +46,19 @@ router.get('/transactions',       admin.listTransactions);
 // Deposits
 router.get('/deposits/stats',       admin.depositStats);
 router.get('/deposits',             admin.listDeposits);
-router.post('/deposits',            admin.createManualDeposit);
-router.put('/deposits/:id/approve', admin.approveDeposit);
-router.put('/deposits/:id/reject',  admin.rejectDeposit);
+router.post('/deposits',            requireRole('ops'), admin.createManualDeposit);
+router.put('/deposits/:id/approve', requireRole('ops'), admin.approveDeposit);
+router.put('/deposits/:id/reject',  requireRole('ops'), admin.rejectDeposit);
 
 // Withdrawals
 router.get('/withdrawals/stats',        admin.withdrawalStats);
 router.get('/withdrawals',              admin.listWithdrawals);
-router.put('/withdrawals/:id/approve',  admin.approveWithdrawal);
-router.put('/withdrawals/:id/reject',   admin.rejectWithdrawal);
+router.put('/withdrawals/:id/approve',  requireRole('ops'), admin.approveWithdrawal);
+router.put('/withdrawals/:id/reject',   requireRole('ops'), admin.rejectWithdrawal);
 
 // Commission
 router.get('/commission-settings',  admin.getCommissionSettings);
-router.put('/commission-settings',  admin.updateCommissionSettings);
+router.put('/commission-settings',  requireRole('ops'), admin.updateCommissionSettings);
 router.get('/commission-history',   admin.commissionHistory);
 
 // Hot Wallets
@@ -68,18 +80,25 @@ router.post('/physical-card-numbers/:id/mark-available',  admin.markCardNumberAv
 
 // Wallet service logs
 router.get('/wallet-service-logs', admin.walletServiceLogs);
+router.get('/uqpay-api-logs',      admin.uqpayApiLogs);
+
+// Admin users (for 2FA management) — super-only: toggling another admin's
+// 2FA can lock them out, and listing admins exposes account metadata.
+router.get('/admins',                  requireRole(), admin.listAdmins);
+router.put('/admins/:id/2fa',          requireRole(), admin.toggleAdmin2FA);
 
 // Merchants
 router.get('/merchants/stats',              merchantCtrl.merchantStats);
 router.get('/merchants',                    merchantCtrl.listMerchants);
 router.get('/merchants/:id',                merchantCtrl.getMerchant);
-router.post('/merchants',                   merchantCtrl.createMerchant);
-router.put('/merchants/:id',                merchantCtrl.updateMerchant);
-router.put('/merchants/:id/activate',       merchantCtrl.activateMerchant);
-router.put('/merchants/:id/deactivate',     merchantCtrl.deactivateMerchant);
-router.post('/merchants/:id/login-as',      merchantCtrl.loginAsMerchant);
+router.post('/merchants',                   requireRole('ops'), merchantCtrl.createMerchant);
+router.put('/merchants/:id',                requireRole('ops'), merchantCtrl.updateMerchant);
+router.put('/merchants/:id/2fa',            requireRole('ops'), merchantCtrl.toggleMerchant2FA);
+router.put('/merchants/:id/activate',       requireRole('ops'), merchantCtrl.activateMerchant);
+router.put('/merchants/:id/deactivate',     requireRole('ops'), merchantCtrl.deactivateMerchant);
+router.post('/merchants/:id/login-as',      requireRole(),      merchantCtrl.loginAsMerchant);  // super-only
 router.get('/merchants/:id/commission',     merchantCtrl.getMerchantCommission);
-router.put('/merchants/:id/commission',     merchantCtrl.updateMerchantCommission);
+router.put('/merchants/:id/commission',     requireRole('ops'), merchantCtrl.updateMerchantCommission);
 
 // Crypto admin
 router.get('/crypto/dashboard',                     crypto.dashboard);

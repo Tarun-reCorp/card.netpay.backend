@@ -10,6 +10,25 @@ function errMsg(err, fallback = 'Provider error') {
   return d?.message || d?.error || d?.msg || err.message || fallback;
 }
 
+// Resolve a uqpayCardId from a route param to our local Card row.
+// Refuses if the card was not issued through this platform — prevents the
+// shared-API-key holder from querying arbitrary UQPay card_ids that happen
+// to belong to other tenants on the same UQPay account.
+// Returns the Card document on success, or null after writing the 404.
+async function requireLocalCard(req, res) {
+  const cardId = req.params.cardId;
+  if (!cardId || typeof cardId !== 'string') {
+    res.status(400).json({ success: false, message: 'cardId is required' });
+    return null;
+  }
+  const card = await Card.findOne({ uqpayCardId: cardId }).select('_id uqpayCardId userId status');
+  if (!card) {
+    res.status(404).json({ success: false, message: 'Card not found' });
+    return null;
+  }
+  return card;
+}
+
 // GET /api/health
 exports.health = (req, res) => {
   res.json({ success: true, status: 'ok', timestamp: new Date() });
@@ -45,7 +64,7 @@ exports.createHolder = async (req, res) => {
 
     res.json({ success: true, holderId: cardholder.cardholder_id });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -116,13 +135,14 @@ exports.issueCard = async (req, res) => {
 
     res.json({ success: true, cardId: card._id, uqpayCardId: uqpayCard.card_id });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // GET /api/cards/:cardId/balance
 exports.getBalance = async (req, res) => {
   try {
+    if (!await requireLocalCard(req, res)) return;
     const info = await UqpayService.getCardInfo(req.params.cardId);
     res.json({
       success: true,
@@ -131,7 +151,7 @@ exports.getBalance = async (req, res) => {
       raw    : info,
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -144,27 +164,41 @@ exports.listCards = async (req, res) => {
     const cards = await Card.find({ uqpayCardholderId: cardholder.cardholder_id }).sort({ createdAt: -1 });
     res.json({ success: true, cards });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // GET /api/cards/:cardId/transactions?page=1&limit=20
 exports.getTransactions = async (req, res) => {
   try {
+    if (!await requireLocalCard(req, res)) return;
     const { page = 1, limit = 20, start, end } = req.query;
     const params = { page_size: Number(limit), page_number: Number(page) };
     if (start) params.start_time = start;
     if (end)   params.end_time   = end;
     const data = await UqpayService.getCardOrders(req.params.cardId, params);
-    res.json({ success: true, transactions: data.records || data.list || data, total: data.total || 0 });
+
+    const extractItems = (r) => {
+      if (Array.isArray(r)) return r;
+      if (!r || typeof r !== 'object') return [];
+      for (const k of ['records', 'orders', 'items', 'list', 'data']) {
+        if (Array.isArray(r[k])) return r[k];
+      }
+      if (r.data && typeof r.data === 'object') return extractItems(r.data);
+      return [];
+    };
+    const items = extractItems(data);
+    const total = Number(data?.total_count ?? data?.total ?? data?.data?.total_count ?? data?.data?.total ?? items.length) || 0;
+    res.json({ success: true, transactions: items, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // POST /api/cards/:cardId/load   body: { amount }
 exports.loadCard = async (req, res) => {
   try {
+    if (!await requireLocalCard(req, res)) return;
     const amount = Number(req.body.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ success: false, message: 'amount must be a positive number' });
@@ -172,13 +206,14 @@ exports.loadCard = async (req, res) => {
     const data = await UqpayService.rechargeCard(req.params.cardId, amount);
     res.json({ success: true, result: data });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // POST /api/cards/:cardId/unload   body: { amount }
 exports.unloadCard = async (req, res) => {
   try {
+    if (!await requireLocalCard(req, res)) return;
     const amount = Number(req.body.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ success: false, message: 'amount must be a positive number' });
@@ -186,49 +221,55 @@ exports.unloadCard = async (req, res) => {
     const data = await UqpayService.withdrawCard(req.params.cardId, amount);
     res.json({ success: true, result: data });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // POST /api/cards/:cardId/freeze
 exports.freezeCard = async (req, res) => {
   try {
+    if (!await requireLocalCard(req, res)) return;
     await UqpayService.updateCardStatus(req.params.cardId, 'FROZEN', req.body?.reason);
     await Card.findOneAndUpdate({ uqpayCardId: req.params.cardId }, { status: 'frozen' });
     res.json({ success: true, message: 'Card frozen' });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // POST /api/cards/:cardId/unfreeze
 exports.unfreezeCard = async (req, res) => {
   try {
+    if (!await requireLocalCard(req, res)) return;
     await UqpayService.updateCardStatus(req.params.cardId, 'ACTIVE', req.body?.reason);
     await Card.findOneAndUpdate({ uqpayCardId: req.params.cardId }, { status: 'active' });
     res.json({ success: true, message: 'Card unfrozen' });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // POST /api/cards/:cardId/terminate
 exports.terminateCard = async (req, res) => {
   try {
+    if (!await requireLocalCard(req, res)) return;
     await UqpayService.updateCardStatus(req.params.cardId, 'CANCELLED', req.body?.reason || 'Terminated via API');
     await Card.findOneAndUpdate({ uqpayCardId: req.params.cardId }, { status: 'cancelled' });
     res.json({ success: true, message: 'Card terminated' });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
-// GET /api/cards/:cardId/reveal — returns decrypted PAN/CVV/expiry
+// GET /api/cards/:cardId/reveal — returns decrypted PAN/CVV/expiry.
+// Local-card guard ensures only platform-issued cards can be revealed, not
+// arbitrary UQPay card_ids from other tenants on the same UQPay account.
 exports.revealCard = async (req, res) => {
   try {
+    if (!await requireLocalCard(req, res)) return;
     const data = await UqpayService.getCardSensitiveInfo(req.params.cardId);
     res.json({ success: true, cardDetails: data });
   } catch (err) {
-    res.status(500).json({ success: false, message: errMsg(err) });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

@@ -1,7 +1,8 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
+const { DEPOSIT_STATUS, DEPOSIT_STATUS_VALUES } = require('../config/statuses');
 
-const CHAINS = ['BEP20', 'TRC20', 'ERC20', 'POLYGON', 'ARBITRUM', 'BASE', 'AVALANCHE', 'OPTIMISM', 'TEST'];
+const CHAINS = ['BEP20', 'TRC20', 'ERC20', 'POLYGON', 'ARBITRUM', 'BASE', 'AVALANCHE', 'OPTIMISM', 'BNB', 'TEST'];
 
 const depositSchema = new Schema({
   userId:          { type: Schema.Types.ObjectId, ref: 'User', required: true },
@@ -18,7 +19,7 @@ const depositSchema = new Schema({
   source:          { type: String, enum: ['auto', 'manual'], default: 'auto' },
   notes:           { type: String, default: null },
   verifiedOnChain: { type: Boolean, default: false },
-  status:          { type: String, enum: ['pending', 'confirming', 'confirmed', 'completed', 'rejected'], default: 'pending' },
+  status:          { type: String, enum: DEPOSIT_STATUS_VALUES, default: DEPOSIT_STATUS.PENDING },
   creditedAt:      { type: Date, default: null },
   rejectedAt:      { type: Date, default: null },
   rejectionReason: { type: String, default: null },
@@ -26,6 +27,18 @@ const depositSchema = new Schema({
 
 depositSchema.index({ toAddress: 1, status: 1 });
 depositSchema.index({ userId: 1, status: 1 });
-depositSchema.index({ txHash: 1 }, { sparse: true });
+// Uniqueness over (chain, txHash) when txHash is a non-empty string.
+// Prevents a chain re-scan / scanner restart / user double-submit from
+// inserting the same on-chain transaction twice. Synthetic txHashes
+// (TEST-…, ADMIN-…) carry sufficient random entropy to coexist; admin
+// manual-deposit may need a retry on a same-millisecond click.
+depositSchema.index(
+  { chain: 1, txHash: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { txHash: { $type: 'string' } },
+    name: 'uniq_chain_txhash',
+  }
+);
 
 module.exports = mongoose.model('Deposit', depositSchema);

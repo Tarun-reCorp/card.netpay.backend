@@ -6,7 +6,7 @@ const adminAuthMiddleware = async (req, res, next) => {
   if (!token) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_ADMIN_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_ADMIN_SECRET, { algorithms: ['HS256'] });
     const admin = await AdminUser.findById(decoded.id).select('-password');
     if (!admin || !admin.isActive) return res.status(401).json({ success: false, message: 'Admin not found' });
     req.admin = admin;

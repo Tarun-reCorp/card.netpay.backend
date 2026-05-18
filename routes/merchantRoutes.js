@@ -5,9 +5,13 @@ const dashboard       = require('../controllers/merchant/merchantDashboardContro
 const cards           = require('../controllers/merchant/merchantCardController');
 const physicalCards   = require('../controllers/merchant/physicalCardController');
 const users           = require('../controllers/merchant/merchantUserController');
+const { loginLimiter, twoFactorLimiter } = require('../middleware/rateLimiters');
 
 // Auth
-router.post('/auth/login', authCtrl.login);
+router.post('/auth/login',         loginLimiter,     authCtrl.login);
+router.post('/auth/2fa/verify',    twoFactorLimiter, authCtrl.verify2FA);
+router.post('/auth/2fa/setup',     twoFactorLimiter, authCtrl.setup2FA);
+router.post('/auth/2fa/enable',    twoFactorLimiter, authCtrl.enable2FA);
 
 // All routes below require merchant token
 router.use(merchantAuth);

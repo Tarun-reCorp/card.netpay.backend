@@ -17,7 +17,7 @@ exports.cardStats = async (req, res) => {
     ]);
     res.json({ success: true, stats: { total, active, frozen, cancelled, pending, virtual, physical } });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -52,6 +52,6 @@ exports.listCards = async (req, res) => {
     ]);
     res.json({ success: true, cards, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

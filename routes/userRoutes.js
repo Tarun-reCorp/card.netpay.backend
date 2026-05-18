@@ -21,8 +21,11 @@ router.post('/kyc/submit',  kyc.upload.fields([
 
 // Wallet
 router.get('/wallet',                        wallet.getWallet);
-router.get('/wallet/deposit/coins',          wallet.getSupportedCoins);
+router.get('/wallet/payment-methods',        wallet.getPaymentMethods);
+router.get('/wallet/cryptrum/deposits',      wallet.cryptrumDeposits);
+router.get('/wallet/cryptrum/withdrawals',   wallet.cryptrumWithdrawals);
 router.post('/wallet/deposit/address',       wallet.getDepositAddress);
+router.post('/wallet/deposit/check',         wallet.checkDeposits);
 router.post('/wallet/deposit/manual',        wallet.submitManualDeposit);
 router.post('/wallet/deposit/static',        wallet.submitStaticDeposit);
 router.get('/wallet/deposit/status/:txHash', wallet.depositStatus);
@@ -44,7 +47,7 @@ router.post('/cards/apply',            card.applyCard);
 router.get('/cards/:id',               card.getCard);
 router.get('/cards/:id/transactions',  card.cardTransactions);
 router.get('/cards/:id/balance',       card.refreshBalance);
-router.post('/cards/:id/topup',        card.topupCard);
+router.post('/cards/:id/deposit',      card.depositCard);
 router.post('/cards/:id/withdraw',     card.withdrawFromCard);
 router.post('/cards/:id/activate',     card.activateCard);
 router.post('/cards/:id/update-pin',   card.updatePin);

@@ -72,7 +72,7 @@ exports.listCardholders = async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -176,7 +176,7 @@ exports.getCardStats = async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -211,7 +211,7 @@ exports.listCards = async (req, res) => {
 
     res.json({ success: true, cards, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 

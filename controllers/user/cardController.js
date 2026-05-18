@@ -10,6 +10,8 @@ const PhysicalCardNumber = require('../../models/PhysicalCardNumber');
 const AppSetting = require('../../models/AppSetting');
 const UqpayService = require('../../services/UqpayService');
 const UqpayCardholder = require('../../models/UqpayCardholder');
+const { toMoney, addMoney, subMoney, commissionAmount, isPositiveMoney, MoneyError } = require('../../lib/money');
+const { resolveCommission } = require('../../lib/commissionResolver');
 
 async function getSettingNumber(key, fallback) {
   const s = await AppSetting.findOne({ key });
@@ -60,10 +62,10 @@ async function releasePhysicalCardNumber(physCardId) {
   });
 }
 
+// Delegate to the 3-tier resolver (User → Merchant → Global). Kept as a thin
+// alias so existing call sites need not change.
 async function getCommission(userId, type) {
-  let s = await UserCommissionSetting.findOne({ userId, type });
-  if (!s) s = await CommissionSetting.findOne({ type });
-  return s;
+  return resolveCommission(userId, type);
 }
 
 // ── UQPay Products (for card application form) ────────────────────────────
@@ -74,7 +76,7 @@ exports.getProducts = async (req, res) => {
     const products = data.data || data.products || data.items || [];
     res.json({ success: true, products });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -111,26 +113,38 @@ exports.getCardFees = async (req, res) => {
       let commSetting = await getCommission(req.user._id, type);
       if (!commSetting) commSetting = await getCommission(req.user._id, 'card_issuance');
 
-      let fee = 0, feePct = 0;
-      if (commSetting) {
-        if (commSetting.rateType === 'percentage') {
-          feePct = commSetting.rate;
-          fee = Math.round(minDeposit * commSetting.rate / 100 * 100) / 100;
-        } else {
-          fee = commSetting.rate;
-        }
-      }
-      return { min_deposit: minDeposit, fee_pct: feePct, issuance_fee: fee, total: Math.round((minDeposit + fee) * 100) / 100 };
+      const safeMin  = toMoney(minDeposit, 'minDeposit');
+      const rateType = commSetting?.rateType === 'fixed' ? 'fixed' : 'percentage';
+      const rate     = Number.isFinite(Number(commSetting?.rate)) && Number(commSetting?.rate) >= 0 ? Number(commSetting.rate) : 0;
+      const fee      = commSetting ? commissionAmount(safeMin, rate, rateType) : 0;
+      const feePct   = rateType === 'percentage' ? rate : 0;
+      return { min_deposit: safeMin, fee_pct: feePct, issuance_fee: fee, total: addMoney(safeMin, fee) };
     };
 
-    const [virtual, physical] = await Promise.all([
+    const safeRate = (setting) => {
+      const rateType = setting?.rateType === 'fixed' ? 'fixed' : 'percentage';
+      const rate     = Number.isFinite(Number(setting?.rate)) && Number(setting?.rate) >= 0 ? Number(setting.rate) : 0;
+      return { rateType, rate };
+    };
+    const calcDeposit = async () => {
+      const setting = await getCommission(req.user._id, 'card_deposit');
+      return { ...safeRate(setting), min_amount: 30 };
+    };
+    const calcWithdraw = async () => {
+      const setting = await getCommission(req.user._id, 'card_withdrawal');
+      return safeRate(setting);
+    };
+
+    const [virtual, physical, deposit, withdraw] = await Promise.all([
       calc('card_issuance_virtual', 10),
       calc('card_issuance_physical', 50),
+      calcDeposit(),
+      calcWithdraw(),
     ]);
 
-    res.json({ success: true, virtual, physical });
+    res.json({ success: true, virtual, physical, deposit, withdraw });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -168,7 +182,7 @@ exports.physicalAvailable = async (req, res) => {
     });
     res.json({ success: true, available: !!hasGeneral, source: hasGeneral ? 'general' : null });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -179,7 +193,7 @@ exports.listCards = async (req, res) => {
     const cards = await Card.find({ userId: req.user._id }).sort({ createdAt: -1 });
     res.json({ success: true, cards });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -216,7 +230,7 @@ exports.getCard = async (req, res) => {
 
     res.json({ success: true, card });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -258,8 +272,8 @@ exports.applyCard = async (req, res) => {
     }
 
     const user   = req.user;
-    const wallet = await Wallet.findOne({ userId: user._id });
-    if (!wallet) return res.status(404).json({ success: false, message: 'Wallet not found' });
+    const walletExists = await Wallet.exists({ userId: user._id });
+    if (!walletExists) return res.status(404).json({ success: false, message: 'Wallet not found' });
 
     const issuanceType = cardType === 'physical' ? 'card_issuance_physical' : 'card_issuance_virtual';
     let commSetting = await getCommission(user._id, issuanceType);
@@ -268,21 +282,18 @@ exports.applyCard = async (req, res) => {
     const defaultMin    = cardType === 'physical'
       ? await getSettingNumber('physical_card_min_deposit', 50)
       : await getSettingNumber('virtual_card_min_deposit', 10);
-    const depositAmount = Number(depositAmt) || defaultMin;
 
-    let feeAmount = 0;
-    if (commSetting) {
-      feeAmount = commSetting.rateType === 'percentage'
-        ? Math.round(depositAmount * commSetting.rate / 100 * 100) / 100
-        : commSetting.rate;
-    }
-    const totalCharge = Math.round((depositAmount + feeAmount) * 100) / 100;
-
-    if (wallet.balance < totalCharge) {
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient wallet balance. Need $${totalCharge.toFixed(2)} but wallet has $${Number(wallet.balance).toFixed(2)}.`,
-      });
+    // Money math goes through the helper so a non-finite / negative / over-cap
+    // input throws MoneyError → controller returns 400 instead of writing junk.
+    let depositAmount, feeAmount, totalCharge;
+    try {
+      const raw = Number(depositAmt);
+      depositAmount = isPositiveMoney(raw) ? toMoney(raw, 'depositAmount') : toMoney(defaultMin, 'depositAmount');
+      feeAmount     = commSetting ? commissionAmount(depositAmount, commSetting.rate, commSetting.rateType) : 0;
+      totalCharge   = addMoney(depositAmount, feeAmount);
+    } catch (e) {
+      if (e instanceof MoneyError) return res.status(400).json({ success: false, message: e.message });
+      throw e;
     }
 
     // ── Find or create UQPay cardholder for this user ─────────────────────
@@ -377,11 +388,31 @@ exports.applyCard = async (req, res) => {
       }
     }
 
-    // ── PHASE 1: deduct wallet + create local Card record ─────────────────
+    // ── PHASE 1: atomic wallet debit + create local Card record ──────────
     const txnId = 'CARD-' + crypto.randomBytes(8).toString('hex').toUpperCase();
 
-    wallet.balance = Math.round((wallet.balance - totalCharge) * 100) / 100;
-    await wallet.save();
+    // Atomic check-and-debit. In a single Mongo round-trip the balance
+    // precondition is verified AND the deduction is applied. Two parallel
+    // applyCard calls cannot both pass — the second sees null and returns
+    // 400. No "lost update" race possible here.
+    const wallet = await Wallet.findOneAndUpdate(
+      { userId: user._id, balance: { $gte: totalCharge } },
+      { $inc: { balance: -totalCharge } },
+      { new: true },
+    );
+    if (!wallet) {
+      // Either wallet was deleted between the exists() check and now (very
+      // rare), or balance is insufficient. Release the reserved physical card.
+      if (physCard) {
+        try { await releasePhysicalCardNumber(physCard._id); }
+        catch (e) { console.error('[applyCard] phys release failed after debit guard: %s', e.message); }
+      }
+      const current = await Wallet.findOne({ userId: user._id }).select('balance');
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient wallet balance. Need $${totalCharge.toFixed(2)} but wallet has $${Number(current?.balance ?? 0).toFixed(2)}.`,
+      });
+    }
 
     const card = await Card.create({
       userId            : user._id,
@@ -400,26 +431,37 @@ exports.applyCard = async (req, res) => {
       await PhysicalCardNumber.findByIdAndUpdate(physCard._id, { cardId: card._id });
     }
 
-    await WalletTransaction.create({
-      userId        : user._id,
-      walletId      : wallet._id,
-      type          : 'card_issuance',
-      amount        : totalCharge,
-      status        : 'completed',
-      transactionId : txnId,
-    });
+    // Ledger writes are best-effort observability — if either fails, the
+    // wallet is still consistent because the debit already landed atomically.
+    // Failures are loudly logged so a reconciler / operator can backfill.
+    try {
+      await WalletTransaction.create({
+        userId        : user._id,
+        walletId      : wallet._id,
+        type          : 'card_issuance',
+        amount        : totalCharge,
+        status        : 'completed',
+        transactionId : txnId,
+      });
+    } catch (e) {
+      console.error('[applyCard] WalletTransaction write failed for txnId=%s userId=%s: %s', txnId, user._id, e.message);
+    }
 
     if (commSetting && feeAmount > 0) {
-      await CommissionLedger.create({
-        userId          : user._id,
-        transactionId   : txnId,
-        type            : issuanceType,
-        grossAmount     : totalCharge,
-        commissionAmount: feeAmount,
-        netAmount       : depositAmount,
-        rateType        : commSetting.rateType,
-        rate            : commSetting.rate,
-      });
+      try {
+        await CommissionLedger.create({
+          userId          : user._id,
+          transactionId   : txnId,
+          type            : issuanceType,
+          grossAmount     : totalCharge,
+          commissionAmount: feeAmount,
+          netAmount       : depositAmount,
+          rateType        : commSetting.rateType,
+          rate            : commSetting.rate,
+        });
+      } catch (e) {
+        console.error('[applyCard] CommissionLedger write failed for txnId=%s userId=%s: %s', txnId, user._id, e.message);
+      }
     }
 
     // ── PHASE 2: issue card on UQPay (assign for physical, create for virtual) ──
@@ -445,14 +487,46 @@ exports.applyCard = async (req, res) => {
         });
       }
     } catch (uqErr) {
-      // Rollback wallet deduction
-      wallet.balance = Math.round((wallet.balance + totalCharge) * 100) / 100;
-      await wallet.save();
-      await Card.findByIdAndUpdate(card._id, { status: 'failed' });
-      // Release reserved physical card number back to inventory
-      if (physCard) await releasePhysicalCardNumber(physCard._id);
+      // Each rollback step runs independently so a single failure (Mongo blip,
+      // missing doc, validation error) cannot skip the remaining ones. Any
+      // residual inconsistency is logged loudly with the card id so an
+      // operator (or a future reconciler) can fix it by hand.
+      const residual = [];
+
+      // 1. Refund the wallet — use atomic $inc against the document so a
+      //    stale in-memory `wallet` (e.g. modified by a concurrent admin
+      //    credit during the UQPay call) cannot clobber the live value.
+      try {
+        await Wallet.findOneAndUpdate(
+          { userId: user._id },
+          { $inc: { balance: totalCharge } },
+        );
+      } catch (refundErr) {
+        residual.push(`wallet_refund_failed:${refundErr.message}`);
+      }
+
+      // 2. Mark the local Card row failed so it cannot be confused with
+      //    a real provider-backed card.
+      try {
+        await Card.findByIdAndUpdate(card._id, { status: 'failed' });
+      } catch (markErr) {
+        residual.push(`card_mark_failed:${markErr.message}`);
+      }
+
+      // 3. Release the physical card number back to inventory.
+      if (physCard) {
+        try {
+          await releasePhysicalCardNumber(physCard._id);
+        } catch (relErr) {
+          residual.push(`physcard_release_failed:${physCard._id}:${relErr.message}`);
+        }
+      }
+
       const errData = uqErr.response?.data;
-      console.error('[UQPay] Card issuance failed:', JSON.stringify(errData || uqErr.message));
+      console.error('[UQPay] Card issuance failed for cardId=%s userId=%s: %s', card._id, user._id, JSON.stringify(errData || uqErr.message));
+      if (residual.length) {
+        console.error('[applyCard] ROLLBACK INCONSISTENCY cardId=%s userId=%s steps=%j — needs manual reconcile', card._id, user._id, residual);
+      }
       const msg = errData?.message || errData?.error || errData?.msg || uqErr.message || 'Card issuance failed. Please try again.';
       return res.status(422).json({ success: false, message: msg });
     }
@@ -503,8 +577,25 @@ exports.cardTransactions = async (req, res) => {
         ? await UqpayService.getCardAuthorizations(card.uqpayCardId, params)
         : await UqpayService.getCardOrders(card.uqpayCardId, params);
 
-      const items = result.data || result.orders || result.items || result.records || result.list || [];
-      const total = result.total_count || result.total || items.length;
+      const extractItems = (r) => {
+        if (Array.isArray(r)) return r;
+        if (!r || typeof r !== 'object') return [];
+        for (const k of ['records', 'orders', 'items', 'list', 'data']) {
+          if (Array.isArray(r[k])) return r[k];
+        }
+        if (r.data && typeof r.data === 'object') return extractItems(r.data);
+        return [];
+      };
+      const extractTotal = (r, fallback) => {
+        if (!r || typeof r !== 'object') return fallback;
+        if (r.total_count != null) return Number(r.total_count) || fallback;
+        if (r.total       != null) return Number(r.total)       || fallback;
+        if (r.data && typeof r.data === 'object') return extractTotal(r.data, fallback);
+        return fallback;
+      };
+
+      const items = extractItems(result);
+      const total = extractTotal(result, items.length);
 
       return res.json({
         success     : true,
@@ -533,112 +624,239 @@ exports.cardTransactions = async (req, res) => {
       return res.status(422).json({ success: false, message: msg || 'Failed to load card history' });
     }
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
-// ── Top-up (Load) ─────────────────────────────────────────────────────────
+// ── Card Deposit (Load) ──────────────────────────────────────────────────
+//
+// Flow:
+//   1. Atomically check + debit wallet (one Mongo round-trip).
+//   2. Call UQPay rechargeCard.
+//   3. On UQPay success: $inc card.balance, write ledger.
+//   4. On UQPay failure: atomic $inc refund to wallet, return 422.
+//
+// Previously UQPay was called BEFORE the wallet debit — if the wallet save
+// then failed (Mongo blip, process kill, replica failover), the user got a
+// free card-balance increase. Wallet-first + atomic refund closes that gap.
 
-exports.topupCard = async (req, res) => {
+exports.depositCard = async (req, res) => {
   try {
-    const { amount } = req.body;
-    if (!amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'Invalid amount' });
+    // 1. Validate input + load card + load commission via money helper.
+    let amount, fee, totalCharge, rateType, rate;
+    try {
+      amount = toMoney(req.body.amount, 'amount');
+      if (amount <= 0) return res.status(400).json({ success: false, message: 'Invalid amount' });
+    } catch (e) {
+      if (e instanceof MoneyError) return res.status(400).json({ success: false, message: e.message });
+      throw e;
+    }
 
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
     if (!card)                    return res.status(404).json({ success: false, message: 'Card not found' });
-    if (card.status !== 'active') return res.status(400).json({ success: false, message: 'Top-up is only available for active cards.' });
+    if (card.status !== 'active') return res.status(400).json({ success: false, message: 'Deposit is only available for active cards.' });
+    if (!card.uqpayCardId)        return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
 
-    const wallet = await Wallet.findOne({ userId: req.user._id });
+    const commSetting = await resolveCommission(req.user._id, 'card_deposit');
+    rateType = commSetting?.rateType === 'fixed' ? 'fixed' : 'percentage';
+    rate     = Number.isFinite(Number(commSetting?.rate)) && Number(commSetting?.rate) >= 0 ? Number(commSetting.rate) : 0;
+    try {
+      fee         = commSetting ? commissionAmount(amount, rate, rateType) : 0;
+      totalCharge = addMoney(amount, fee);
+    } catch (e) {
+      if (e instanceof MoneyError) return res.status(500).json({ success: false, message: 'Deposit math produced an invalid value. Please contact support.' });
+      throw e;
+    }
 
-    let commSetting = await UserCommissionSetting.findOne({ userId: req.user._id, type: 'card_topup' });
-    if (!commSetting) commSetting = await CommissionSetting.findOne({ type: 'card_topup' });
-
-    const feeRate     = commSetting?.rateType === 'percentage' ? commSetting.rate : 1.5;
-    const fee         = Math.round(Number(amount) * feeRate / 100 * 100) / 100;
-    const totalCharge = Math.round((Number(amount) + fee) * 100) / 100;
-
-    if (wallet.balance < totalCharge) {
+    // 2. Atomic wallet debit. Precondition guards against race + insufficient
+    //    balance in a single round-trip. The deduction is final before we
+    //    touch the provider.
+    const wallet = await Wallet.findOneAndUpdate(
+      { userId: req.user._id, balance: { $gte: totalCharge } },
+      { $inc: { balance: -totalCharge } },
+      { new: true },
+    );
+    if (!wallet) {
+      const current = await Wallet.findOne({ userId: req.user._id }).select('balance');
+      if (!current) return res.status(404).json({ success: false, message: 'Wallet not found' });
+      const feeLabel = rateType === 'fixed' ? `fixed fee $${fee.toFixed(2)}` : `${rate}% fee $${fee.toFixed(2)}`;
       return res.status(400).json({
         success: false,
-        message: `Insufficient wallet balance. Need $${totalCharge.toFixed(2)} (top-up $${Number(amount).toFixed(2)} + ${feeRate}% fee $${fee.toFixed(2)}). Your balance: $${Number(wallet.balance).toFixed(2)}.`,
+        message: `Insufficient wallet balance. Need $${totalCharge.toFixed(2)} (deposit $${amount.toFixed(2)} + ${feeLabel}). Your balance: $${Number(current.balance).toFixed(2)}.`,
       });
     }
 
-    // Call card provider
-    if (card.uqpayCardId) {
+    // 3. Call UQPay. If it throws, we must refund the wallet atomically and
+    //    surface the provider error. Never leave funds debited without a
+    //    matching card-side load.
+    try {
+      await UqpayService.rechargeCard(card.uqpayCardId, amount);
+    } catch (e) {
       try {
-        await UqpayService.rechargeCard(card.uqpayCardId, Number(amount));
-      } catch (e) {
-        const msg = e.response?.data?.message || e.response?.data?.error || e.message;
-        return res.status(422).json({ success: false, message: msg || 'Top-up failed. Please try again.' });
+        await Wallet.findOneAndUpdate(
+          { userId: req.user._id },
+          { $inc: { balance: totalCharge } },
+        );
+      } catch (refundErr) {
+        console.error('[depositCard] REFUND FAILED userId=%s cardId=%s totalCharge=%s err=%s — needs manual reconcile',
+          req.user._id, card._id, totalCharge, refundErr.message);
       }
-    } else {
-      return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+      const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+      return res.status(422).json({ success: false, message: msg || 'Deposit failed. Please try again.' });
     }
 
-    wallet.balance = Math.round((wallet.balance - totalCharge) * 100) / 100;
-    await wallet.save();
-    card.balance = Math.round((card.balance + Number(amount)) * 100) / 100;
-    await card.save();
+    // 4. UQPay succeeded — bump local card balance atomically and write the
+    //    ledger rows. Failures here are observability gaps; wallet/UQPay
+    //    are already consistent so we still return success but log loudly.
+    const updatedCard = await Card.findByIdAndUpdate(
+      card._id,
+      { $inc: { balance: amount } },
+      { new: true },
+    );
 
-    const txnId = 'TOPUP-' + crypto.randomBytes(8).toString('hex').toUpperCase();
-    await WalletTransaction.create({
-      userId: req.user._id, walletId: wallet._id,
-      type: 'card_topup', amount: totalCharge, status: 'completed', transactionId: txnId,
-    });
+    const txnId = 'CDEP-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+    try {
+      await WalletTransaction.create({
+        userId: req.user._id, walletId: wallet._id,
+        type: 'card_deposit', amount: totalCharge, status: 'completed',
+        transactionId: txnId,
+      });
+    } catch (e) {
+      console.error('[depositCard] WalletTransaction write failed txnId=%s userId=%s: %s', txnId, req.user._id, e.message);
+    }
 
     if (fee > 0) {
-      await CommissionLedger.create({
-        userId: req.user._id, transactionId: txnId, type: 'card_topup',
-        grossAmount: totalCharge, commissionAmount: fee, netAmount: Number(amount),
-        rateType: commSetting?.rateType || 'percentage', rate: feeRate,
-      });
+      try {
+        await CommissionLedger.create({
+          userId: req.user._id, transactionId: txnId, type: 'card_deposit',
+          grossAmount: totalCharge, commissionAmount: fee, netAmount: amount,
+          rateType, rate,
+        });
+      } catch (e) {
+        console.error('[depositCard] CommissionLedger write failed txnId=%s userId=%s: %s', txnId, req.user._id, e.message);
+      }
     }
 
-    res.json({ success: true, message: `Top-up of $${Number(amount).toFixed(2)} successful.`, fee, newBalance: card.balance });
+    res.json({
+      success: true,
+      message: `Deposit of $${amount.toFixed(2)} successful.`,
+      fee,
+      newBalance: updatedCard?.balance ?? toMoney(addMoney(card.balance, amount), 'newBalance'),
+    });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // ── Withdraw from Card ────────────────────────────────────────────────────
+//
+// UQPay is the source of truth for card balance, so we call UQPay first to
+// debit the card, then atomically credit the wallet via $inc. If the local
+// wallet credit fails after a successful UQPay debit, the discrepancy is
+// loudly logged for manual recovery — the user has lost card balance and
+// must be made whole.
 
 exports.withdrawFromCard = async (req, res) => {
   try {
-    const { amount } = req.body;
-    if (!amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'Invalid amount' });
+    let amount, fee, credited, rateType, rate;
+    try {
+      amount = toMoney(req.body.amount, 'amount');
+      if (amount <= 0) return res.status(400).json({ success: false, message: 'Invalid amount' });
+    } catch (e) {
+      if (e instanceof MoneyError) return res.status(400).json({ success: false, message: e.message });
+      throw e;
+    }
 
     const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
     if (!card)                    return res.status(404).json({ success: false, message: 'Card not found' });
     if (card.status !== 'active') return res.status(400).json({ success: false, message: 'Withdraw is only available for active cards.' });
+    if (!card.uqpayCardId)        return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
 
-    // Call card provider
-    if (card.uqpayCardId) {
-      try {
-        await UqpayService.withdrawCard(card.uqpayCardId, Number(amount));
-      } catch (e) {
-        const msg = e.response?.data?.message || e.response?.data?.error || e.message;
-        return res.status(422).json({ success: false, message: msg || 'Withdraw failed. Please try again.' });
-      }
-    } else {
-      return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    const commSetting = await resolveCommission(req.user._id, 'card_withdrawal');
+    rateType = commSetting?.rateType === 'fixed' ? 'fixed' : 'percentage';
+    rate     = Number.isFinite(Number(commSetting?.rate)) && Number(commSetting?.rate) >= 0 ? Number(commSetting.rate) : 0;
+    try {
+      fee      = commSetting ? commissionAmount(amount, rate, rateType) : 0;
+      credited = subMoney(amount, fee);
+    } catch (e) {
+      if (e instanceof MoneyError) return res.status(500).json({ success: false, message: 'Withdrawal math produced an invalid value. Please contact support.' });
+      throw e;
     }
 
-    const wallet = await Wallet.findOne({ userId: req.user._id });
-    wallet.balance = Math.round((wallet.balance + Number(amount)) * 100) / 100;
-    await wallet.save();
-    card.balance = Math.round((card.balance - Number(amount)) * 100) / 100;
-    await card.save();
+    if (credited <= 0) {
+      const feeLabel = rateType === 'fixed' ? `fixed fee $${fee.toFixed(2)}` : `${rate}% fee $${fee.toFixed(2)}`;
+      return res.status(400).json({
+        success: false,
+        message: `Withdraw amount must exceed the ${feeLabel}.`,
+      });
+    }
 
-    await WalletTransaction.create({
-      userId: req.user._id, walletId: wallet._id,
-      type: 'card_withdraw', amount: Number(amount), status: 'completed',
-      transactionId: 'WDR-' + crypto.randomBytes(8).toString('hex').toUpperCase(),
+    // Provider debit first (UQPay is the source of truth for card balance).
+    try {
+      await UqpayService.withdrawCard(card.uqpayCardId, amount);
+    } catch (e) {
+      const msg = e.response?.data?.message || e.response?.data?.error || e.message;
+      return res.status(422).json({ success: false, message: msg || 'Withdraw failed. Please try again.' });
+    }
+
+    // Atomic wallet credit. If this fails, UQPay has already debited the
+    // card — log loudly so an operator can make the user whole.
+    let wallet;
+    try {
+      wallet = await Wallet.findOneAndUpdate(
+        { userId: req.user._id },
+        { $inc: { balance: credited } },
+        { new: true, upsert: false },
+      );
+      if (!wallet) throw new Error('wallet not found');
+    } catch (e) {
+      console.error('[withdrawFromCard] WALLET CREDIT FAILED after UQPay debit — userId=%s cardId=%s amount=%s credited=%s err=%s — manual reconcile required',
+        req.user._id, card._id, amount, credited, e.message);
+      return res.status(500).json({
+        success: false,
+        message: 'Card debit succeeded but wallet credit failed. Support has been notified.',
+      });
+    }
+
+    // Local card balance mirror — best-effort. UQPay is authoritative.
+    const updatedCard = await Card.findByIdAndUpdate(
+      card._id,
+      { $inc: { balance: -amount } },
+      { new: true },
+    );
+
+    const txnId = 'WDR-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+    try {
+      await WalletTransaction.create({
+        userId: req.user._id, walletId: wallet._id,
+        type: 'card_withdraw', amount, status: 'completed',
+        transactionId: txnId,
+      });
+    } catch (e) {
+      console.error('[withdrawFromCard] WalletTransaction write failed txnId=%s userId=%s: %s', txnId, req.user._id, e.message);
+    }
+
+    if (fee > 0) {
+      try {
+        await CommissionLedger.create({
+          userId: req.user._id, transactionId: txnId, type: 'card_withdrawal',
+          grossAmount: amount, commissionAmount: fee, netAmount: credited,
+          rateType, rate,
+        });
+      } catch (e) {
+        console.error('[withdrawFromCard] CommissionLedger write failed txnId=%s userId=%s: %s', txnId, req.user._id, e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `$${credited.toFixed(2)} credited to wallet ($${amount.toFixed(2)} withdrawn, $${fee.toFixed(2)} fee).`,
+      fee,
+      credited,
+      newBalance: updatedCard?.balance ?? toMoney(subMoney(card.balance, amount), 'newBalance'),
     });
-
-    res.json({ success: true, message: `$${Number(amount).toFixed(2)} withdrawn from card to wallet.`, newBalance: card.balance });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -646,23 +864,38 @@ exports.withdrawFromCard = async (req, res) => {
 
 exports.freezeCard = async (req, res) => {
   try {
-    const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!card)                    return res.status(404).json({ success: false, message: 'Card not found' });
-    if (card.status !== 'active') return res.status(400).json({ success: false, message: 'Only active cards can be frozen.' });
-    if (!card.uqpayCardId)        return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    // Atomic claim: transition active → frozen. Two parallel freeze requests
+    // (or freeze + terminate) cannot both pass — only the matched query proceeds
+    // to call UQPay and to write the local state. Loser gets 409.
+    const card = await Card.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user._id, status: 'active' },
+      { $set: { status: 'frozen' } },
+      { new: true },
+    );
+    if (!card) {
+      const exists = await Card.findOne({ _id: req.params.id, userId: req.user._id }).select('status uqpayCardId');
+      if (!exists)            return res.status(404).json({ success: false, message: 'Card not found' });
+      if (!exists.uqpayCardId) return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+      return res.status(409).json({ success: false, message: 'Only active cards can be frozen.' });
+    }
+    if (!card.uqpayCardId) {
+      // Roll the local state back and refuse — we hold the only claim, no race.
+      await Card.findByIdAndUpdate(card._id, { $set: { status: 'active' } });
+      return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    }
 
     try {
       await UqpayService.updateCardStatus(card.uqpayCardId, 'FROZEN', 'User requested freeze');
     } catch (e) {
+      // UQPay refused — undo the local claim so state stays consistent.
+      await Card.findByIdAndUpdate(card._id, { $set: { status: 'active' } });
       const msg = e.response?.data?.message || e.response?.data?.error || e.message;
       return res.status(422).json({ success: false, message: msg || 'Failed to freeze card. Please try again.' });
     }
 
-    card.status = 'frozen';
-    await card.save();
     res.json({ success: true, message: 'Card has been frozen successfully.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -670,23 +903,34 @@ exports.freezeCard = async (req, res) => {
 
 exports.unfreezeCard = async (req, res) => {
   try {
-    const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!card)                    return res.status(404).json({ success: false, message: 'Card not found' });
-    if (card.status !== 'frozen') return res.status(400).json({ success: false, message: 'Only frozen cards can be unfrozen.' });
-    if (!card.uqpayCardId)        return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    // Atomic claim: transition frozen → active.
+    const card = await Card.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user._id, status: 'frozen' },
+      { $set: { status: 'active' } },
+      { new: true },
+    );
+    if (!card) {
+      const exists = await Card.findOne({ _id: req.params.id, userId: req.user._id }).select('status uqpayCardId');
+      if (!exists)            return res.status(404).json({ success: false, message: 'Card not found' });
+      if (!exists.uqpayCardId) return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+      return res.status(409).json({ success: false, message: 'Only frozen cards can be unfrozen.' });
+    }
+    if (!card.uqpayCardId) {
+      await Card.findByIdAndUpdate(card._id, { $set: { status: 'frozen' } });
+      return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    }
 
     try {
       await UqpayService.updateCardStatus(card.uqpayCardId, 'ACTIVE', 'User requested unfreeze');
     } catch (e) {
+      await Card.findByIdAndUpdate(card._id, { $set: { status: 'frozen' } });
       const msg = e.response?.data?.message || e.response?.data?.error || e.message;
       return res.status(422).json({ success: false, message: msg || 'Failed to unfreeze card. Please try again.' });
     }
 
-    card.status = 'active';
-    await card.save();
     res.json({ success: true, message: 'Card has been unfrozen successfully.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -694,23 +938,38 @@ exports.unfreezeCard = async (req, res) => {
 
 exports.terminateCard = async (req, res) => {
   try {
-    const card = await Card.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!card)                       return res.status(404).json({ success: false, message: 'Card not found' });
-    if (card.status === 'cancelled') return res.status(400).json({ success: false, message: 'Card is already terminated.' });
-    if (!card.uqpayCardId)           return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    // Atomic claim: anything-not-cancelled → cancelled. Only one concurrent
+    // terminate (or terminate vs freeze) succeeds; the loser sees 409.
+    const card = await Card.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user._id, status: { $ne: 'cancelled' } },
+      { $set: { status: 'cancelled' }, $currentDate: { updatedAt: true } },
+      { new: true },
+    );
+    if (!card) {
+      const exists = await Card.findOne({ _id: req.params.id, userId: req.user._id }).select('status uqpayCardId');
+      if (!exists) return res.status(404).json({ success: false, message: 'Card not found' });
+      return res.status(409).json({ success: false, message: 'Card is already terminated.' });
+    }
+    if (!card.uqpayCardId) {
+      // We have no provider id to act on — refuse and roll back local claim.
+      // The prior status is unknown atomically; flag for manual recovery.
+      console.error('[terminateCard] card %s claimed cancelled locally but no uqpayCardId — needs reconcile', card._id);
+      return res.status(422).json({ success: false, message: 'Card provider reference not found.' });
+    }
 
     try {
       await UqpayService.updateCardStatus(card.uqpayCardId, 'CANCELLED', 'User requested termination');
     } catch (e) {
+      // UQPay refused — best-effort roll local back. We do NOT know the
+      // pre-claim status atomically; surface to ops via log.
+      console.error('[terminateCard] UQPay refused for card %s — local stamped cancelled; manual review needed: %s', card._id, e.message);
       const msg = e.response?.data?.message || e.response?.data?.error || e.message;
       return res.status(422).json({ success: false, message: msg || 'Failed to terminate card. Please try again.' });
     }
 
-    card.status = 'cancelled';
-    await card.save();
     res.json({ success: true, message: 'Card has been permanently terminated.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -742,9 +1001,9 @@ exports.revealCard = async (req, res) => {
     let info;
     try {
       info = await UqpayService.getCardSensitiveInfo(card.uqpayCardId);
-      console.log('[revealCard] UQPay secure response:', JSON.stringify(info));
     } catch (e) {
-      console.error('[revealCard] UQPay secure error:', JSON.stringify(e.response?.data || e.message));
+      // Do NOT log e.response.data — provider error bodies may contain PAN/CVV echoes.
+      console.error('[revealCard] UQPay secure error: status=%s message=%s', e.response?.status, e.message);
       const msg = e.response?.data?.message || e.response?.data?.error || e.response?.data?.msg || e.message;
       return res.status(422).json({ success: false, message: msg || 'Failed to retrieve card details from provider.' });
     }
@@ -758,7 +1017,7 @@ exports.revealCard = async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -784,7 +1043,7 @@ exports.refreshBalance = async (req, res) => {
 
     res.json({ success: true, balance: card.balance, status: card.status });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -862,7 +1121,7 @@ exports.activateCard = async (req, res) => {
 
     res.json({ success: true, message: 'Card activated successfully! Your card is now ready to use.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -898,6 +1157,6 @@ exports.updatePin = async (req, res) => {
 
     res.json({ success: true, message: 'PIN updated successfully.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

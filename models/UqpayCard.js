@@ -15,7 +15,8 @@ const uqpayCardSchema = new Schema({
   create_time:    { type: Date, default: Date.now },
 }, { timestamps: true, collection: 'uqpay_cards' });
 
+// cardholder_id: secondary lookup (not unique — one cardholder owns many cards).
+// card_id: already covered by the field-level `unique: true` above; no extra index needed.
 uqpayCardSchema.index({ cardholder_id: 1 });
-uqpayCardSchema.index({ card_id: 1 });
 
 module.exports = mongoose.model('UqpayCard', uqpayCardSchema);

@@ -13,7 +13,7 @@ exports.dashboard = async (req, res) => {
     ]);
     res.json({ success: true, stats: { totalUsers, totalCards, availablePhysicalCards } });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -30,6 +30,6 @@ exports.profile = async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

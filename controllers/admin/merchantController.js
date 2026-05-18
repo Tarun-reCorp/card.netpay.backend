@@ -4,6 +4,7 @@ const Merchant = require('../../models/Merchant');
 const MerchantCommissionSetting = require('../../models/MerchantCommissionSetting');
 const CommissionSetting = require('../../models/CommissionSetting');
 const User = require('../../models/User');
+const { writeAudit } = require('../../lib/audit');
 
 function merchantUrls(merchant) {
   const base = (process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173').replace(/\/$/, '');
@@ -26,7 +27,7 @@ exports.merchantStats = async (req, res) => {
     ]);
     res.json({ success: true, total, active, inactive, whitelabel });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -44,7 +45,7 @@ exports.listMerchants = async (req, res) => {
     ];
 
     const [merchants, total] = await Promise.all([
-      Merchant.find(filter).select('-password').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(Number(limit)),
+      Merchant.find(filter).select('-password -twoFactorSecret').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(Number(limit)),
       Merchant.countDocuments(filter),
     ]);
 
@@ -65,19 +66,19 @@ exports.listMerchants = async (req, res) => {
 
     res.json({ success: true, merchants: enriched, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // GET /admin/merchants/:id
 exports.getMerchant = async (req, res) => {
   try {
-    const merchant = await Merchant.findById(req.params.id).select('-password');
+    const merchant = await Merchant.findById(req.params.id).select('-password -twoFactorSecret');
     if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
     const userCount = await User.countDocuments({ merchantId: merchant._id });
     res.json({ success: true, merchant: { ...merchant.toObject(), ...merchantUrls(merchant) }, userCount });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -116,29 +117,100 @@ exports.createMerchant = async (req, res) => {
 
     res.status(201).json({ success: true, merchant: { id: merchant._id, name: merchant.name, email: merchant.email } });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // PUT /admin/merchants/:id
+//
+// Strict allow-list — only these fields can be mutated through the admin
+// edit form. Mass-assignment via req.body (e.g. setting
+// {twoFactorEnabled:false, twoFactorSecret:null, status:'active', isAdmin:true})
+// to neutralize a merchant's 2FA or escalate privileges is no longer possible.
+const MERCHANT_EDITABLE_FIELDS = [
+  'name', 'email', 'phone', 'tag', 'logo', 'titleTag',
+  'type', 'showPoweredBy', 'primaryColor', 'secondaryColor',
+  'virtualMinDeposit', 'physicalMinDeposit',
+  'address', 'country',
+];
+
 exports.updateMerchant = async (req, res) => {
   try {
-    const { password, ...updates } = req.body;
+    const body = req.body || {};
+    const updates = {};
+    for (const field of MERCHANT_EDITABLE_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(body, field)) {
+        updates[field] = body[field];
+      }
+    }
 
-    if (password) {
-      if (password.length < 8)
+    // Password is handled separately so the plaintext is hashed before write.
+    if (body.password) {
+      if (typeof body.password !== 'string' || body.password.length < 8) {
         return res.status(422).json({ success: false, message: 'Password must be at least 8 characters' });
-      updates.password = await bcrypt.hash(password, 12);
+      }
+      updates.password = await bcrypt.hash(body.password, 12);
     }
 
     if (updates.type === 'whitelabel') updates.showPoweredBy = false;
-    if (updates.tag) updates.tag = updates.tag.toLowerCase();
+    if (updates.tag && typeof updates.tag === 'string') updates.tag = updates.tag.toLowerCase();
+    if (updates.email && typeof updates.email === 'string') updates.email = updates.email.trim().toLowerCase();
 
-    const merchant = await Merchant.findByIdAndUpdate(req.params.id, updates, { new: true }).select('-password');
+    if (Object.prototype.hasOwnProperty.call(updates, 'virtualMinDeposit')) {
+      const v = updates.virtualMinDeposit;
+      updates.virtualMinDeposit = (v === '' || v === null || v === undefined) ? null : Number(v);
+      if (updates.virtualMinDeposit !== null && (!Number.isFinite(updates.virtualMinDeposit) || updates.virtualMinDeposit < 0)) {
+        return res.status(422).json({ success: false, message: 'virtualMinDeposit must be a non-negative finite number' });
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'physicalMinDeposit')) {
+      const v = updates.physicalMinDeposit;
+      updates.physicalMinDeposit = (v === '' || v === null || v === undefined) ? null : Number(v);
+      if (updates.physicalMinDeposit !== null && (!Number.isFinite(updates.physicalMinDeposit) || updates.physicalMinDeposit < 0)) {
+        return res.status(422).json({ success: false, message: 'physicalMinDeposit must be a non-negative finite number' });
+      }
+    }
+
+    const merchant = await Merchant.findByIdAndUpdate(
+      req.params.id,
+      updates,
+      { new: true, runValidators: true, context: 'query' },
+    ).select('-password -twoFactorSecret');
     if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
     res.json({ success: true, merchant });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// PUT /admin/merchants/:id/2fa   body: { enabled: boolean }
+// Enabling: flag the merchant so the next login forces them through TOTP setup.
+// Disabling: clear the requirement, the activation flag, and the stored secret.
+exports.toggleMerchant2FA = async (req, res) => {
+  try {
+    const enabled = req.body?.enabled === true || req.body?.enabled === 'true';
+    const updates = enabled
+      ? { twoFactorRequired: true }
+      : { twoFactorRequired: false, twoFactorEnabled: false, twoFactorSecret: null };
+
+    const merchant = await Merchant.findByIdAndUpdate(req.params.id, updates, { new: true })
+      .select('-password -twoFactorSecret');
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+
+    writeAudit(req, {
+      action: enabled ? 'merchant.2fa.require' : 'merchant.2fa.disable',
+      targetType: 'Merchant',
+      targetId: merchant._id,
+      payload: { merchantEmail: merchant.email },
+    });
+
+    res.json({
+      success: true,
+      message: enabled ? '2FA required on next login' : '2FA disabled and reset',
+      merchant,
+    });
+  } catch (err) {
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -148,7 +220,7 @@ exports.activateMerchant = async (req, res) => {
     await Merchant.findByIdAndUpdate(req.params.id, { status: 'active' });
     res.json({ success: true, message: 'Merchant activated' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -158,20 +230,30 @@ exports.deactivateMerchant = async (req, res) => {
     await Merchant.findByIdAndUpdate(req.params.id, { status: 'inactive' });
     res.json({ success: true, message: 'Merchant deactivated' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
 // POST /admin/merchants/:id/login-as
 exports.loginAsMerchant = async (req, res) => {
   try {
-    const merchant = await Merchant.findById(req.params.id).select('-password');
+    const merchant = await Merchant.findById(req.params.id).select('-password -twoFactorSecret');
     if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
     if (merchant.status !== 'active') return res.status(403).json({ success: false, message: 'Merchant is inactive' });
-    const token = jwt.sign({ id: merchant._id }, process.env.JWT_MERCHANT_SECRET, { expiresIn: '1h' });
+    const token = jwt.sign(
+      { id: merchant._id, actorAdminId: String(req.admin?._id || ''), purpose: 'impersonation' },
+      process.env.JWT_MERCHANT_SECRET,
+      { expiresIn: '1h' },
+    );
+    writeAudit(req, {
+      action: 'session.impersonateMerchant',
+      targetType: 'Merchant',
+      targetId: merchant._id,
+      payload: { merchantEmail: merchant.email },
+    });
     res.json({ success: true, token, merchant: { id: merchant._id, name: merchant.name, email: merchant.email } });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -210,7 +292,7 @@ exports.getMerchantCommission = async (req, res) => {
       physicalMinDeposit: merchant.physicalMinDeposit,
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -219,23 +301,47 @@ exports.updateMerchantCommission = async (req, res) => {
   try {
     const { commission, virtualMinDeposit, physicalMinDeposit } = req.body;
 
-    if (commission) {
+    if (commission && typeof commission === 'object') {
       for (const [type, s] of Object.entries(commission)) {
+        if (!s || typeof s !== 'object') {
+          return res.status(422).json({ success: false, message: `Invalid commission payload for ${type}` });
+        }
+        const rateType = s.rateType === 'fixed' ? 'fixed' : 'percentage';
+        const rate = Number(s.rate);
+        if (!Number.isFinite(rate) || rate < 0) {
+          return res.status(422).json({ success: false, message: `rate must be a non-negative finite number (${type})` });
+        }
+        const cap = rateType === 'percentage' ? 100 : 10000;
+        if (rate > cap) {
+          return res.status(422).json({ success: false, message: `rate exceeds maximum (${cap}) for ${rateType} commission on ${type}` });
+        }
         await MerchantCommissionSetting.findOneAndUpdate(
           { merchantId: req.params.id, type },
-          { rateType: s.rateType, rate: Number(s.rate) },
-          { upsert: true, new: true },
+          { rateType, rate },
+          { upsert: true, new: true, runValidators: true },
         );
       }
     }
 
     const minUpdate = {};
-    if (virtualMinDeposit  !== undefined) minUpdate.virtualMinDeposit  = virtualMinDeposit  ? Number(virtualMinDeposit)  : null;
-    if (physicalMinDeposit !== undefined) minUpdate.physicalMinDeposit = physicalMinDeposit ? Number(physicalMinDeposit) : null;
+    if (virtualMinDeposit  !== undefined) {
+      const v = virtualMinDeposit ? Number(virtualMinDeposit) : null;
+      if (v !== null && (!Number.isFinite(v) || v < 0)) {
+        return res.status(422).json({ success: false, message: 'virtualMinDeposit must be a non-negative finite number' });
+      }
+      minUpdate.virtualMinDeposit = v;
+    }
+    if (physicalMinDeposit !== undefined) {
+      const v = physicalMinDeposit ? Number(physicalMinDeposit) : null;
+      if (v !== null && (!Number.isFinite(v) || v < 0)) {
+        return res.status(422).json({ success: false, message: 'physicalMinDeposit must be a non-negative finite number' });
+      }
+      minUpdate.physicalMinDeposit = v;
+    }
     if (Object.keys(minUpdate).length) await Merchant.findByIdAndUpdate(req.params.id, minUpdate);
 
     res.json({ success: true, message: 'Commission settings updated' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

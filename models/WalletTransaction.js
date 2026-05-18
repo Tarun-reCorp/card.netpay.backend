@@ -1,12 +1,13 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
+const { TRANSACTION_STATUS, TRANSACTION_STATUS_VALUES } = require('../config/statuses');
 
 const walletTransactionSchema = new Schema({
   userId:         { type: Schema.Types.ObjectId, ref: 'User', required: true },
   walletId:       { type: Schema.Types.ObjectId, ref: 'Wallet', required: true },
-  type:           { type: String, enum: ['deposit', 'withdraw', 'card_issuance', 'card_issuance_virtual', 'card_issuance_physical', 'card_topup', 'card_withdraw'], required: true },
+  type:           { type: String, enum: ['deposit', 'withdraw', 'card_issuance', 'card_issuance_virtual', 'card_issuance_physical', 'card_deposit', 'card_withdraw'], required: true },
   amount:         { type: Number, required: true },
-  status:         { type: String, enum: ['pending', 'completed', 'rejected', 'approved', 'processing', 'failed'], default: 'pending' },
+  status:         { type: String, enum: TRANSACTION_STATUS_VALUES, default: TRANSACTION_STATUS.PENDING },
   paymentGateway: { type: String, default: null },
   transactionId:  { type: String, unique: true, required: true },
   referenceId:    { type: String, default: null },
@@ -22,7 +23,7 @@ const walletTransactionSchema = new Schema({
   wsbOrderNo:     { type: String, default: null },
 }, { timestamps: true, collection: 'wallet_transactions' });
 
+// transactionId: already covered by the field-level `unique: true` above.
 walletTransactionSchema.index({ userId: 1, status: 1 });
-walletTransactionSchema.index({ transactionId: 1 }, { unique: true });
 
 module.exports = mongoose.model('WalletTransaction', walletTransactionSchema);

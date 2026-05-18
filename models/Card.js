@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
+const { CARD_STATUS, CARD_STATUS_VALUES } = require('../config/statuses');
 
 const cardSchema = new Schema({
   userId:             { type: Schema.Types.ObjectId, ref: 'User', required: true },
@@ -10,7 +11,7 @@ const cardSchema = new Schema({
   currency:           { type: String, default: 'USD' },
   cardType:           { type: String, enum: ['virtual', 'physical'], default: 'virtual' },
   deliveryInfo:       { type: Schema.Types.Mixed, default: null },
-  status:             { type: String, enum: ['pending', 'active', 'frozen', 'cancelled', 'processing', 'failed'], default: 'pending' },
+  status:             { type: String, enum: CARD_STATUS_VALUES, default: CARD_STATUS.PENDING },
   balance:            { type: Number, default: 0 },
   expireDate:         { type: String, default: null },
   depositAmount:      { type: Number, default: 0 },

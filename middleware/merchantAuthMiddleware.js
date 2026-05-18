@@ -6,11 +6,12 @@ const merchantAuthMiddleware = async (req, res, next) => {
   if (!token) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_MERCHANT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_MERCHANT_SECRET, { algorithms: ['HS256'] });
     const merchant = await Merchant.findById(decoded.id).select('-password');
     if (!merchant) return res.status(401).json({ success: false, message: 'Merchant not found' });
     if (merchant.status !== 'active') return res.status(403).json({ success: false, message: 'Merchant account inactive' });
     req.merchant = merchant;
+    if (decoded.actorAdminId) req.impersonatedBy = decoded.actorAdminId;
     next();
   } catch {
     res.status(401).json({ success: false, message: 'Invalid token' });

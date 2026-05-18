@@ -7,7 +7,7 @@ exports.getProfile = async (req, res) => {
     const user = await User.findById(req.user._id).select('-password -twoFactorSecret');
     res.json({ success: true, user });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -24,6 +24,6 @@ exports.changePassword = async (req, res) => {
     await user.save();
     res.json({ success: true, message: 'Password updated' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

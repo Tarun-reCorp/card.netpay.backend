@@ -74,7 +74,7 @@ exports.getKyc = async (req, res) => {
 
     res.json({ success: true, kyc: obj });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -108,6 +108,6 @@ exports.submitKyc = async (req, res) => {
     await User.findByIdAndUpdate(req.user._id, update);
     res.json({ success: true, message: 'KYC submitted successfully' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

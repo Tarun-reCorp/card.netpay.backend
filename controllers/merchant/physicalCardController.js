@@ -13,7 +13,7 @@ exports.physicalCardStats = async (req, res) => {
     ]);
     res.json({ success: true, stats: { total, available, preassigned, used } });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -43,7 +43,7 @@ exports.listPhysicalCards = async (req, res) => {
     ]);
     res.json({ success: true, cards, total });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -69,7 +69,7 @@ exports.assignToUser = async (req, res) => {
     await card.save();
     res.json({ success: true, message: `Card pre-assigned to ${user.name}` });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -85,6 +85,6 @@ exports.unassignFromUser = async (req, res) => {
     await card.save();
     res.json({ success: true, message: 'Pre-assignment removed. Card returned to merchant pool.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

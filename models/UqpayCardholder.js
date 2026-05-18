@@ -17,7 +17,7 @@ const uqpayCardholderSchema = new Schema({
   document_type:     { type: String, default: null },
 }, { timestamps: true, collection: 'uqpay_cardholders' });
 
+// cardholder_id: already covered by the field-level `unique: true` above.
 uqpayCardholderSchema.index({ email: 1 });
-uqpayCardholderSchema.index({ cardholder_id: 1 });
 
 module.exports = mongoose.model('UqpayCardholder', uqpayCardholderSchema);
