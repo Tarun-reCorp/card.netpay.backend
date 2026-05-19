@@ -263,9 +263,7 @@ exports.applyCard = async (req, res) => {
       }
     }
 
-    if (req.user.kycStatus !== 'approved') {
-      return res.status(403).json({ success: false, message: 'KYC approval required to apply for a card.' });
-    }
+    // KYC enforcement lives on the route (`requireKyc` middleware).
 
     if (!card_product_id) {
       return res.status(400).json({ success: false, message: 'Please select a card product.' });

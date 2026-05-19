@@ -162,21 +162,47 @@ async function getDepositList(opts = {}) {
 // POST /withdraw (raw JSON) — submits a withdrawal to an external address.
 // args: { referenceId, paymentMethodId, amount, toAddress }
 // Returns { withdrawCode, message } on success.
+//
+// This is the last barrier before money leaves the platform. Even though
+// callers validate upstream, every assumption is re-checked here so a buggy
+// caller can never push a malformed payload to Cryptrum.
 async function createWithdraw({ referenceId, paymentMethodId, amount, toAddress } = {}) {
-  if (!referenceId)              throw new Error('referenceId is required');
-  if (paymentMethodId == null)   throw new Error('paymentMethodId is required');
-  if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
-    throw new Error('amount must be a positive number');
+  // referenceId — required, string-coercible, capped length so we don't get 422'd
+  if (referenceId == null || String(referenceId).trim() === '') {
+    throw new Error('referenceId is required');
   }
-  if (!toAddress)                throw new Error('toAddress is required');
+  const refId = String(referenceId).trim();
+  if (refId.length > 64) throw new Error('referenceId too long (max 64 chars)');
+
+  // paymentMethodId — strictly a positive integer
+  const pmId = Number(paymentMethodId);
+  if (!Number.isInteger(pmId) || pmId <= 0) {
+    throw new Error('paymentMethodId must be a positive integer');
+  }
+
+  // amount — positive finite, capped ceiling, sane decimals
+  const amt = Number(amount);
+  if (!Number.isFinite(amt))   throw new Error('amount must be a number');
+  if (amt <= 0)                throw new Error('amount must be positive');
+  if (amt > 1_000_000)         throw new Error('amount exceeds platform ceiling');
+  const rounded = Math.round(amt * 1e8) / 1e8;  // clip to 8 dp — Cryptrum settles at this precision
+  if (rounded <= 0)            throw new Error('amount rounds to zero');
+
+  // toAddress — non-empty string, sane length, no whitespace inside
+  if (typeof toAddress !== 'string' || !toAddress.trim()) {
+    throw new Error('toAddress is required');
+  }
+  const addr = toAddress.trim();
+  if (addr.length < 20 || addr.length > 100) throw new Error('toAddress length out of range');
+  if (/\s/.test(addr)) throw new Error('toAddress contains whitespace');
 
   let data;
   try {
     const res = await client().post('/withdraw', {
-      reference_id:      String(referenceId),
-      payment_method_id: Number(paymentMethodId),
-      amount:            Number(amount),
-      to_address:        String(toAddress),
+      reference_id:      refId,
+      payment_method_id: pmId,
+      amount:            rounded,
+      to_address:        addr,
     }, { headers: { 'Content-Type': 'application/json' } });
     data = res.data;
   } catch (err) { rethrow(err, 'withdraw'); }

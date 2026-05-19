@@ -11,6 +11,7 @@ const CommissionSetting = require('../../models/CommissionSetting');
 const UserCommissionSetting = require('../../models/UserCommissionSetting');
 const CommissionLedger = require('../../models/CommissionLedger');
 const { resolveCommission } = require('../../lib/commissionResolver');
+const { validateAmount, validateAddress, familyForMethod } = require('../../lib/cryptoValidation');
 const cryptrum = require('../../services/CryptrumService');
 
 // GET /user/wallet
@@ -501,58 +502,148 @@ exports.listDeposits = async (req, res) => {
 };
 
 // POST /user/wallet/withdraw
+//
+// Crypto withdrawals are auto-pushed to Cryptrum at submission — there is no
+// admin approval step. The provider processes the payout on-chain; admins
+// only monitor the resulting record.
+//
+// KYC is enforced at the route layer (`requireKyc` middleware) so it cannot
+// be forgotten on new wallet-mutating endpoints.
+//
+// Defense layers (in order — first fail returns with no wallet mutation):
+//   1. paymentMethodId validated as a positive integer.
+//   2. Cryptrum is the source of truth for the network — we fetch the method
+//      to confirm it exists, withdrawals are enabled, and derive the canonical
+//      chain name + address family (never trust the caller's `chain` string).
+//   3. Amount validated for type / range / decimals via `validateAmount`.
+//   4. Address regex-validated against the derived family.
+//   5. Atomic balance check + lock via `findOneAndUpdate` with a
+//      `balance: { $gte: amount }` precondition. Race-safe: two concurrent
+//      submits cannot both pass; one gets `null` and a 400.
+//   6. Withdrawal row insert — pending until Cryptrum responds.
+//   7. Push to Cryptrum. On success: promote to `approved`, release the lock
+//      (funds are with the provider now). On failure: refund the user, delete
+//      the row, return the provider error so the user can retry cleanly.
 exports.initiateWithdraw = async (req, res) => {
   try {
-    const { chain, amount, toAddress, coinKey } = req.body;
-    const paymentMethodId = req.body.paymentMethodId != null ? Number(req.body.paymentMethodId) : null;
-    if (!chain || !amount || !toAddress) return res.status(400).json({ success: false, message: 'chain, amount, toAddress required' });
-    if (paymentMethodId != null && (!Number.isInteger(paymentMethodId) || paymentMethodId <= 0)) {
-      return res.status(400).json({ success: false, message: 'paymentMethodId must be a positive integer' });
+    // KYC enforcement lives on the route (`requireKyc` middleware).
+
+    // (1) paymentMethodId
+    const paymentMethodId = Number(req.body.paymentMethodId);
+    if (!Number.isInteger(paymentMethodId) || paymentMethodId <= 0) {
+      return res.status(400).json({ success: false, message: 'A valid paymentMethodId is required' });
     }
 
-    if (req.user.kycStatus !== 'approved') return res.status(403).json({ success: false, message: 'KYC approval required' });
+    // (2) Verify against Cryptrum — the provider is the source of truth.
+    let method;
+    try {
+      const { items } = await cryptrum.getPaymentMethods('withdraw');
+      method = items.find(m => m.id === paymentMethodId);
+    } catch (e) {
+      return res.status(e.status || 502).json({ success: false, message: e.message || 'Failed to verify network with provider' });
+    }
+    if (!method) {
+      return res.status(400).json({ success: false, message: 'Unknown payment network' });
+    }
+    if (!method.withdrawEnabled) {
+      return res.status(400).json({ success: false, message: `Withdrawals are currently disabled on ${method.networkName}` });
+    }
+    const chain  = String(method.networkName || '').toUpperCase();   // canonical
+    const family = familyForMethod(method);
 
-    // Commission calculation (read-only — does not mutate wallet)
+    // (3) Amount
+    const amtResult = validateAmount(req.body.amount);
+    if (!amtResult.ok) return res.status(400).json({ success: false, message: amtResult.error });
+    const amount = amtResult.amount;
+
+    // (4) Address
+    const addrResult = validateAddress(req.body.toAddress, { chain, family });
+    if (!addrResult.ok) return res.status(400).json({ success: false, message: addrResult.error });
+    const toAddress = addrResult.address;
+
+    // Commission resolution (read-only — uses the validated, rounded amount)
     let commSetting = await UserCommissionSetting.findOne({ userId: req.user._id, type: 'withdrawal' });
     if (!commSetting) commSetting = await CommissionSetting.findOne({ type: 'withdrawal' });
-
     let fee = 0;
     if (commSetting) {
-      fee = commSetting.rateType === 'percentage' ? (amount * commSetting.rate) / 100 : commSetting.rate;
+      fee = commSetting.rateType === 'percentage'
+        ? Math.round((amount * commSetting.rate) / 100 * 100) / 100
+        : commSetting.rate;
     }
-    const netAmount = amount - fee;
+    const netAmount = Math.max(0, Math.round((amount - fee) * 100) / 100);
 
-    // Atomic check-and-debit: in a single round-trip Mongo verifies the user
-    // has the funds AND moves them from balance → locked. Two parallel
-    // submits (double-click / network retry) cannot both pass the precondition,
-    // so duplicate `pending` withdrawals for the same balance are impossible.
+    // (5) Atomic check-and-debit — single round-trip verifies funds AND moves
+    // them from balance → locked. Two parallel submits cannot both pass the
+    // precondition, so over-withdrawal via double-click is impossible.
     const wallet = await Wallet.findOneAndUpdate(
       { userId: req.user._id, balance: { $gte: amount } },
       { $inc: { balance: -amount, locked: amount } },
       { new: true },
     );
     if (!wallet) {
-      // Either the wallet doesn't exist, or balance was insufficient — keep
-      // the original 400 response shape for the UI's existing handling.
       const exists = await Wallet.exists({ userId: req.user._id });
       if (!exists) return res.status(404).json({ success: false, message: 'Wallet not found' });
       return res.status(400).json({ success: false, message: 'Insufficient balance' });
     }
 
+    // Refund helper — restores locked → balance. Always idempotent-safe via
+    // the `locked: { $gte: amount }` precondition.
+    const refundLock = () => Wallet.findOneAndUpdate(
+      { userId: req.user._id, locked: { $gte: amount } },
+      { $inc: { balance: amount, locked: -amount } },
+    );
+
+    // (6) Withdrawal row insert — roll back the lock if it fails
     let withdrawal;
     try {
       withdrawal = await Withdrawal.create({
-        userId: req.user._id, chain, asset: 'USDT', amount, fee, toAddress, paymentMethodId, status: 'pending',
+        userId: req.user._id,
+        chain,
+        asset: 'USDT',
+        amount,
+        fee,
+        toAddress,
+        paymentMethodId,
+        status: 'pending',
       });
     } catch (createErr) {
-      // Withdrawal row failed to persist — release the funds we just locked
-      // so the user isn't left with a phantom hold.
-      await Wallet.findOneAndUpdate(
-        { userId: req.user._id, locked: { $gte: amount } },
-        { $inc: { balance: amount, locked: -amount } },
-      );
+      await refundLock();
       throw createErr;
     }
+
+    // (7) Auto-push to Cryptrum. Crypto withdrawals don't need admin approval
+    // — the provider handles on-chain settlement directly. If the push fails,
+    // refund the user and delete the row so they can re-submit without a
+    // ghost "pending" entry sitting in their history.
+    let cryptrumResp;
+    try {
+      cryptrumResp = await cryptrum.createWithdraw({
+        referenceId:     withdrawal._id.toString(),
+        paymentMethodId,
+        amount,
+        toAddress,
+      });
+    } catch (e) {
+      await refundLock();
+      await Withdrawal.deleteOne({ _id: withdrawal._id });
+      console.error('[Cryptrum] initiateWithdraw push failed:', e.message);
+      return res.status(e.status || 502).json({
+        success: false,
+        message: e.message || 'Cryptrum rejected the withdrawal — please try again.',
+      });
+    }
+
+    // Provider accepted the payout: promote to `approved`, save the code so
+    // refreshWithdrawalStatus can poll it, and release the lock — those funds
+    // are now in Cryptrum's hands, not ours.
+    withdrawal.status       = 'approved';
+    withdrawal.cryptrumCode = cryptrumResp.withdrawCode || null;
+    await withdrawal.save();
+
+    await Wallet.findOneAndUpdate(
+      { userId: req.user._id, locked: { $gte: amount } },
+      { $inc: { locked: -amount } },
+    );
 
     const txId = crypto.randomBytes(16).toString('hex');
     await WalletTransaction.create({
@@ -560,7 +651,7 @@ exports.initiateWithdraw = async (req, res) => {
       walletId: wallet._id,
       type: 'withdraw',
       amount,
-      status: 'pending',
+      status: 'approved',
       transactionId: txId,
       referenceId: withdrawal._id.toString(),
       chain,
@@ -579,7 +670,12 @@ exports.initiateWithdraw = async (req, res) => {
       });
     }
 
-    res.json({ success: true, message: 'Withdrawal request submitted', withdrawalId: withdrawal._id });
+    res.json({
+      success: true,
+      message: 'Withdrawal submitted to Cryptrum for on-chain processing',
+      withdrawalId: withdrawal._id,
+      cryptrumCode: withdrawal.cryptrumCode,
+    });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }

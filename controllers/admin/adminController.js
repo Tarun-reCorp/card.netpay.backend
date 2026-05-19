@@ -929,6 +929,7 @@ async function findWithdrawalTxn(withdrawal) {
 exports.approveWithdrawal = async (req, res) => {
   try {
     const cryptrum = require('../../services/CryptrumService');
+    const { validateAmount, validateAddress, familyForMethod } = require('../../lib/cryptoValidation');
 
     // Atomic transition: pending → approved. Two concurrent admin clicks both
     // hit this; only one matches { status: 'pending' } and proceeds. We do
@@ -945,13 +946,52 @@ exports.approveWithdrawal = async (req, res) => {
       return res.status(409).json({ success: false, message: 'Withdrawal already actioned' });
     }
 
+    // Helper: revert the row to pending so the admin can fix / retry.
+    const revert = (note) => Withdrawal.updateOne(
+      { _id: withdrawal._id },
+      { $set: { status: 'pending', approvedBy: null, ...(note ? { rejectionReason: note } : {}) } },
+    );
+
     if (!withdrawal.paymentMethodId) {
-      // Roll back the status; this row was created before Cryptrum integration.
-      await Withdrawal.updateOne({ _id: withdrawal._id }, { $set: { status: 'pending' } });
+      await revert();
       return res.status(400).json({
         success: false,
         message: 'This withdrawal has no Cryptrum paymentMethodId — cannot push to provider.',
       });
+    }
+
+    // Re-validate amount, address, and network against current Cryptrum state.
+    // Catches: provider disabled the network, address formats changed, stale data.
+    const amtRes = validateAmount(withdrawal.amount);
+    if (!amtRes.ok) {
+      await revert(`Invalid amount: ${amtRes.error}`);
+      return res.status(400).json({ success: false, message: `Cannot push to provider — ${amtRes.error}` });
+    }
+
+    let method;
+    try {
+      const { items } = await cryptrum.getPaymentMethods('withdraw');
+      method = items.find(m => m.id === withdrawal.paymentMethodId);
+    } catch (e) {
+      await revert();
+      return res.status(e.status || 502).json({ success: false, message: e.message || 'Failed to verify network with provider' });
+    }
+    if (!method) {
+      await revert();
+      return res.status(400).json({ success: false, message: 'Cryptrum no longer recognises this paymentMethodId' });
+    }
+    if (!method.withdrawEnabled) {
+      await revert();
+      return res.status(400).json({ success: false, message: `Withdrawals are currently disabled on ${method.networkName}` });
+    }
+
+    const addrRes = validateAddress(withdrawal.toAddress, {
+      chain:  method.networkName,
+      family: familyForMethod(method),
+    });
+    if (!addrRes.ok) {
+      await revert(`Invalid address: ${addrRes.error}`);
+      return res.status(400).json({ success: false, message: `Cannot push to provider — ${addrRes.error}` });
     }
 
     let cryptrumResp;
@@ -959,8 +999,8 @@ exports.approveWithdrawal = async (req, res) => {
       cryptrumResp = await cryptrum.createWithdraw({
         referenceId:     withdrawal._id.toString(),
         paymentMethodId: withdrawal.paymentMethodId,
-        amount:          withdrawal.amount,
-        toAddress:       withdrawal.toAddress,
+        amount:          amtRes.amount,
+        toAddress:       addrRes.address,
       });
     } catch (e) {
       // Provider failed — revert to pending so the admin can retry / reject.

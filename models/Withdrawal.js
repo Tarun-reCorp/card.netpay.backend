@@ -15,7 +15,8 @@ const withdrawalSchema = new Schema({
   fromAddress:      { type: String, default: null },
   hotWalletId:      { type: Schema.Types.ObjectId, ref: 'HotWallet', default: null },
   // Cryptrum routing: paymentMethodId is captured at request time; cryptrumCode
-  // is the withdraw_code returned by Cryptrum once the admin approves and pushes.
+  // is the withdraw_code returned by Cryptrum when the user submits — the
+  // request is auto-pushed to the provider, not gated by admin approval.
   paymentMethodId:  { type: Number, default: null },
   cryptrumCode:     { type: String, default: null },
   status:           { type: String, enum: WITHDRAWAL_STATUS_VALUES, default: WITHDRAWAL_STATUS.PENDING },
