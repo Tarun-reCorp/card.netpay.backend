@@ -2,7 +2,8 @@ const mongoose = require('mongoose');
 const { Schema } = mongoose;
 const { WITHDRAWAL_STATUS, WITHDRAWAL_STATUS_VALUES } = require('../config/statuses');
 
-const CHAINS = ['BEP20', 'TRC20', 'ERC20', 'POLYGON', 'ARBITRUM', 'BASE', 'AVALANCHE', 'OPTIMISM'];
+// Keep in sync with models/Deposit.js — same canonical set Cryptrum uses.
+const CHAINS = ['BEP20', 'TRC20', 'ERC20', 'POLYGON', 'ARBITRUM', 'BASE', 'AVALANCHE', 'OPTIMISM', 'BNB', 'TEST'];
 
 const withdrawalSchema = new Schema({
   userId:           { type: Schema.Types.ObjectId, ref: 'User', required: true },
@@ -27,5 +28,12 @@ const withdrawalSchema = new Schema({
 
 withdrawalSchema.index({ userId: 1, status: 1 });
 withdrawalSchema.index({ status: 1 });
+withdrawalSchema.index({ userId: 1, createdAt: -1 });
+// cryptrumCode lookup by refreshWithdrawalStatus — sparse because synthetic
+// (admin/manual) rows don't have one.
+withdrawalSchema.index(
+  { cryptrumCode: 1 },
+  { partialFilterExpression: { cryptrumCode: { $type: 'string' } } },
+);
 
 module.exports = mongoose.model('Withdrawal', withdrawalSchema);

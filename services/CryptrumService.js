@@ -45,6 +45,67 @@ function ensureSuccess(data, label) {
   }
 }
 
+// Cryptrum's `deposit_status` is a numeric phase, not a boolean.
+//   0 = Pending                          (chain has not seen the tx yet)
+//   1 = Completed                        (credit-able — funds collected)
+//   2 = Queued for Verification          (txHash submitted, awaiting confs)
+//   3 = Hash Verified (Awaiting Gas)     (confs done; gas top-up pending)
+//   4 = Gas Transferred (Awaiting Collect) (gas funded; sweep pending)
+//   5 = Failed                           (terminal — will not complete)
+//
+// Only phase 1 is credit-able. 0/2/3/4 are in-flight and should re-poll.
+// 5 is terminal-failed and should stop polling.
+const CRYPTRUM_DEPOSIT_STATUS = Object.freeze({
+  0: { code: 'pending',                          label: 'Pending',                          confirmed: false, terminal: false },
+  1: { code: 'completed',                        label: 'Completed',                        confirmed: true,  terminal: true  },
+  2: { code: 'queued-for-verification',          label: 'Queued for Verification',          confirmed: false, terminal: false },
+  3: { code: 'hash-verified-awaiting-gas',       label: 'Hash Verified (Awaiting Gas)',     confirmed: false, terminal: false },
+  4: { code: 'gas-transferred-awaiting-collect', label: 'Gas Transferred (Awaiting Collect)', confirmed: false, terminal: false },
+  5: { code: 'failed',                           label: 'Failed',                           confirmed: false, terminal: true  },
+});
+
+function describeDepositStatus(raw) {
+  const n = Number(raw);
+  if (Number.isInteger(n) && CRYPTRUM_DEPOSIT_STATUS[n]) {
+    return { raw: n, ...CRYPTRUM_DEPOSIT_STATUS[n] };
+  }
+  return { raw, code: 'unknown', label: `Unknown (${raw})`, confirmed: false, terminal: false };
+}
+
+// Cryptrum's `withdraw_list.status` is also a numeric phase. Eight values:
+//   0 = Pending                          (received, not yet picked up)
+//   1 = Completed                        (terminal — sent and confirmed)
+//   2 = Queued for Verification          (in queue for hash-verification)
+//   3 = Processing Transfer              (signing / broadcasting)
+//   4 = Energy Transferred               (Tron-specific gas / energy step)
+//   5 = Awaiting Blockchain Confirmation (broadcast, waiting confs)
+//   6 = Unsuccessful                     (terminal — refund the user)
+//   7 = Cancelled                        (terminal — refund the user)
+//
+// `completed` ⇒ release the local row as `completed`.
+// `failed`/`cancelled` ⇒ release the local row as `failed`/`rejected` AND
+// credit the user's wallet back (Cryptrum still holds the funds because the
+// on-chain payout did not succeed).
+// Anything else is in-flight; the caller re-polls.
+const CRYPTRUM_WITHDRAW_STATUS = Object.freeze({
+  0: { code: 'pending',                         label: 'Pending',                          completed: false, failed: false, cancelled: false, terminal: false },
+  1: { code: 'completed',                       label: 'Completed',                        completed: true,  failed: false, cancelled: false, terminal: true  },
+  2: { code: 'queued-for-verification',         label: 'Queued for Verification',          completed: false, failed: false, cancelled: false, terminal: false },
+  3: { code: 'processing-transfer',             label: 'Processing Transfer',              completed: false, failed: false, cancelled: false, terminal: false },
+  4: { code: 'energy-transferred',              label: 'Energy Transferred',               completed: false, failed: false, cancelled: false, terminal: false },
+  5: { code: 'awaiting-blockchain-confirmation', label: 'Awaiting Blockchain Confirmation', completed: false, failed: false, cancelled: false, terminal: false },
+  6: { code: 'unsuccessful',                    label: 'Unsuccessful',                     completed: false, failed: true,  cancelled: false, terminal: true  },
+  7: { code: 'cancelled',                       label: 'Cancelled',                        completed: false, failed: false, cancelled: true,  terminal: true  },
+});
+
+function describeWithdrawStatus(raw) {
+  const n = Number(raw);
+  if (Number.isInteger(n) && CRYPTRUM_WITHDRAW_STATUS[n]) {
+    return { raw: n, ...CRYPTRUM_WITHDRAW_STATUS[n] };
+  }
+  return { raw, code: 'unknown', label: `Unknown (${raw})`, completed: false, failed: false, cancelled: false, terminal: false };
+}
+
 function normalizeMethod(r, imageBaseUrl) {
   return {
     id:              r.id,
@@ -138,16 +199,30 @@ async function getDepositList(opts = {}) {
     totalDepositAmount:  d.total_deposit_amount,
     verifiedDeposit:     d.verified_deposit,
     totalDeposit:        d.total_deposit,
-    deposits:            (d.deposit_list?.data || []).map(row => ({
-      uniqueId:     row.unique_id,
-      txHash:       row.thash,
-      amount:       row.amount,
-      usdtAmount:   row.usdt_amount,
-      status:       row.deposit_status,    // 0 = pending, 1 = confirmed
-      name:         row.name,
-      networkName:  row.network_name,
-      createdAt:    row.created_at,
-    })),
+    deposits:            (d.deposit_list?.data || []).map(row => {
+      const phase = describeDepositStatus(row.deposit_status);
+      return {
+        uniqueId:     row.unique_id,
+        txHash:       row.thash,
+        amount:       row.amount,
+        usdtAmount:   row.usdt_amount,
+        // Raw numeric phase from Cryptrum (0..5) — see CRYPTRUM_DEPOSIT_STATUS.
+        status:       phase.raw,
+        // Stable kebab-case identifier — safe for switch / UI keys.
+        statusCode:   phase.code,
+        // Human-readable label — surface to the user as-is.
+        statusLabel:  phase.label,
+        // True only for phase 1 (the only credit-able phase).
+        confirmed:    phase.confirmed,
+        // True for phases 1 and 5 — caller should stop polling.
+        terminal:     phase.terminal,
+        toAddress:    row.to_address || row.address || null,
+        fromAddress:  row.from_address || null,
+        name:         row.name,
+        networkName:  row.network_name,
+        createdAt:    row.created_at,
+      };
+    }),
     pagination: {
       currentPage: d.deposit_list?.current_page,
       perPage:     d.deposit_list?.per_page,
@@ -241,19 +316,29 @@ async function getWithdrawList(opts = {}) {
   ensureSuccess(data, 'withdraw-list');
   const d = data.data || {};
   return {
-    withdrawals: (d.data || []).map(row => ({
-      code:               row.code,
-      referenceId:        row.reference_id,
-      amount:             row.amount,
-      withdrawableAmount: row.withdrawable_amount,
-      toAddress:          row.to_address,
-      txHash:             row.thash,
-      status:             row.status,        // 0 = pending, 1 = completed
-      txHashVerified:     row.thash_verify === 1,
-      name:               row.name,
-      networkName:        row.network_name,
-      createdAt:          row.created_at,
-    })),
+    withdrawals: (d.data || []).map(row => {
+      const phase = describeWithdrawStatus(row.status);
+      return {
+        code:               row.code,
+        referenceId:        row.reference_id,
+        amount:             row.amount,
+        withdrawableAmount: row.withdrawable_amount,
+        toAddress:          row.to_address,
+        txHash:             row.thash,
+        // Raw numeric phase (0..7) — see CRYPTRUM_WITHDRAW_STATUS.
+        status:             phase.raw,
+        statusCode:         phase.code,
+        statusLabel:        phase.label,
+        completed:          phase.completed,
+        failed:             phase.failed,
+        cancelled:          phase.cancelled,
+        terminal:           phase.terminal,
+        txHashVerified:     row.thash_verify === 1,
+        name:               row.name,
+        networkName:        row.network_name,
+        createdAt:          row.created_at,
+      };
+    }),
     pagination: {
       currentPage: d.current_page,
       perPage:     d.per_page,
@@ -272,4 +357,8 @@ module.exports = {
   getDepositList,
   createWithdraw,
   getWithdrawList,
+  CRYPTRUM_DEPOSIT_STATUS,
+  describeDepositStatus,
+  CRYPTRUM_WITHDRAW_STATUS,
+  describeWithdrawStatus,
 };

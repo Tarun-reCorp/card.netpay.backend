@@ -27,17 +27,27 @@ const depositSchema = new Schema({
 
 depositSchema.index({ toAddress: 1, status: 1 });
 depositSchema.index({ userId: 1, status: 1 });
-// Uniqueness over (chain, txHash) when txHash is a non-empty string.
-// Prevents a chain re-scan / scanner restart / user double-submit from
-// inserting the same on-chain transaction twice. Synthetic txHashes
-// (TEST-…, ADMIN-…) carry sufficient random entropy to coexist; admin
-// manual-deposit may need a retry on a same-millisecond click.
+depositSchema.index({ userId: 1, createdAt: -1 });
+// Uniqueness over `txHash` alone (not (chain, txHash)).
+// Reason: EVM chains (BEP20, ERC20, POLYGON, ARBITRUM, BASE, AVALANCHE,
+// OPTIMISM) all share the same 0x… address format and HD-derive from one
+// key, so the same address shows up on every EVM chain. If we keyed on
+// (chain, txHash), a polled deposit could be credited once as BEP20 and
+// again as POLYGON whenever Cryptrum mislabels or repeats the row across
+// payment-method IDs. Post-EIP-155 every signed tx is bound to a single
+// chain-id, so a real txHash is globally unique by construction; keying
+// on txHash closes the cross-chain replay hole.
+// Synthetic txHashes (TEST-… / ADMIN-…) include random hex so they
+// coexist; manual-deposit re-clicks still see E11000 and return the
+// "already submitted" message.
+// Migration: see scripts/migrateDepositIndexes.js — drops the old
+// uniq_chain_txhash index before the new one is built.
 depositSchema.index(
-  { chain: 1, txHash: 1 },
+  { txHash: 1 },
   {
     unique: true,
     partialFilterExpression: { txHash: { $type: 'string' } },
-    name: 'uniq_chain_txhash',
+    name: 'uniq_txhash',
   }
 );
 

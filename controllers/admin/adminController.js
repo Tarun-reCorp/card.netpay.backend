@@ -23,6 +23,7 @@ const { toMoney, MoneyError } = require('../../lib/money');
 const { writeAudit } = require('../../lib/audit');
 const {
   CARD_STATUS,
+  DEPOSIT_STATUS,
   KYC_STATUS,
   TRANSACTION_STATUS,
 } = require('../../config/statuses');
@@ -842,6 +843,54 @@ exports.rejectDeposit = async (req, res) => {
     });
 
     res.json({ success: true, message: 'Deposit rejected' });
+  } catch (err) {
+    console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// POST /admin/deposits/expire-stale  body: { olderThanDays?: number, dryRun?: boolean }
+//
+// Marks manual `pending` Deposit rows older than `olderThanDays` (default 30)
+// as `rejected` with reason=`expired`. Audit trail is preserved — no rows
+// are deleted. Auto-source rows are left alone because they are normally
+// short-lived (created already-confirmed by checkDeposits) and an unconfirmed
+// auto row indicates a Cryptrum-side mismatch worth a human look.
+exports.expireStaleDeposits = async (req, res) => {
+  try {
+    const days   = Number(req.body.olderThanDays ?? 30);
+    const dryRun = Boolean(req.body.dryRun);
+    if (!Number.isFinite(days) || days < 1) {
+      return res.status(400).json({ success: false, message: 'olderThanDays must be >= 1' });
+    }
+
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const filter = {
+      status:    DEPOSIT_STATUS.PENDING,
+      source:    'manual',
+      createdAt: { $lt: cutoff },
+    };
+
+    if (dryRun) {
+      const count = await Deposit.countDocuments(filter);
+      return res.json({ success: true, dryRun: true, wouldExpire: count, cutoff });
+    }
+
+    const now = new Date();
+    const result = await Deposit.updateMany(filter, {
+      $set: {
+        status:          DEPOSIT_STATUS.REJECTED,
+        rejectedAt:      now,
+        rejectionReason: 'expired',
+      },
+    });
+
+    writeAudit(req, {
+      action: 'deposit.expire-stale',
+      targetType: 'Deposit',
+      payload: { olderThanDays: days, cutoff, matched: result.matchedCount, modified: result.modifiedCount },
+    });
+
+    res.json({ success: true, expired: result.modifiedCount, matched: result.matchedCount, cutoff });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }

@@ -49,6 +49,7 @@ router.get('/deposits',             admin.listDeposits);
 router.post('/deposits',            requireRole('ops'), admin.createManualDeposit);
 router.put('/deposits/:id/approve', requireRole('ops'), admin.approveDeposit);
 router.put('/deposits/:id/reject',  requireRole('ops'), admin.rejectDeposit);
+router.post('/deposits/expire-stale', requireRole('ops'), admin.expireStaleDeposits);
 
 // Withdrawals
 router.get('/withdrawals/stats',        admin.withdrawalStats);

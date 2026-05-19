@@ -25,5 +25,17 @@ const walletTransactionSchema = new Schema({
 
 // transactionId: already covered by the field-level `unique: true` above.
 walletTransactionSchema.index({ userId: 1, status: 1 });
+walletTransactionSchema.index({ userId: 1, createdAt: -1 });
+// refreshWithdrawalStatus does findOneAndUpdate({ referenceId }, …) — sparse
+// since most non-withdrawal txns don't set referenceId.
+walletTransactionSchema.index(
+  { referenceId: 1 },
+  { partialFilterExpression: { referenceId: { $type: 'string' } } },
+);
+// Used by deposit/manual flows that look rows up by txHash.
+walletTransactionSchema.index(
+  { txHash: 1 },
+  { partialFilterExpression: { txHash: { $type: 'string' } } },
+);
 
 module.exports = mongoose.model('WalletTransaction', walletTransactionSchema);

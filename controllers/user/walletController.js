@@ -7,11 +7,14 @@ const WalletAddress = require('../../models/WalletAddress');
 const ImportedWallet = require('../../models/ImportedWallet');
 const Deposit = require('../../models/Deposit');
 const Withdrawal = require('../../models/Withdrawal');
-const CommissionSetting = require('../../models/CommissionSetting');
-const UserCommissionSetting = require('../../models/UserCommissionSetting');
 const CommissionLedger = require('../../models/CommissionLedger');
 const { resolveCommission } = require('../../lib/commissionResolver');
 const { validateAmount, validateAddress, familyForMethod } = require('../../lib/cryptoValidation');
+const {
+  verifyDepositOwnership,
+  computeCommission,
+  selectAddressesToCheck,
+} = require('../../lib/cryptoFlow');
 const cryptrum = require('../../services/CryptrumService');
 
 // GET /user/wallet
@@ -60,150 +63,82 @@ exports.cryptrumDeposits = async (req, res) => {
   }
 };
 
-// POST /user/wallet/deposit/check  body: { paymentMethodId }
+// POST /user/wallet/deposit/check  body: { paymentMethodId? }
 //
 // Reconciles confirmed deposits from Cryptrum into this user's wallet.
-// Race-safe by design:
-//   1. Each Cryptrum `thash` insert into `deposits` is guarded by the unique
-//      partial index `uniq_chain_txhash` on (chain, txHash). A duplicate
-//      insert fails with E11000 — the wallet credit never runs.
+//
+//   • If `paymentMethodId` is given, only that network is checked.
+//   • If omitted, EVERY cached address on the user is checked.
+//     Useful when the user pays on a different EVM chain than they
+//     generated the address on (BEP20 / POLYGON / ERC20 share addresses).
+//
+// Race-safety primitives (per credit):
+//   1. Unique partial index on `Deposit.txHash` is the dedup primitive —
+//      a duplicate insert fails with E11000 and the wallet credit never runs.
 //   2. The Deposit insert, Wallet $inc, WalletTransaction insert, and
-//      CommissionLedger insert all run inside one Mongo transaction
-//      (`session.withTransaction`). If any step fails, the entire
-//      credit is rolled back atomically.
-//   3. Re-poll, double-click, parallel tab, parallel admin trigger — only
-//      one transaction can ever commit per Cryptrum thash. The rest see
-//      "already credited" and silently skip.
+//      CommissionLedger insert all run inside one `session.withTransaction`.
+//      Any step failing rolls the whole credit back atomically.
+//   3. Parallel polls all converge — only one tx commits per txHash, the
+//      rest see `already-credited` in their `skipped[]` and silently move on.
 exports.checkDeposits = async (req, res) => {
   try {
-    const paymentMethodId = Number(req.body.paymentMethodId);
-    if (!Number.isInteger(paymentMethodId) || paymentMethodId <= 0) {
-      return res.status(400).json({ success: false, message: 'paymentMethodId is required' });
+    // ── (1) Validate & resolve target networks ────────────────────────
+    const paymentMethodId = req.body.paymentMethodId == null
+      ? null
+      : Number(req.body.paymentMethodId);
+    if (paymentMethodId != null && (!Number.isInteger(paymentMethodId) || paymentMethodId <= 0)) {
+      return res.status(400).json({ success: false, message: 'paymentMethodId must be a positive integer' });
     }
 
     const User = require('../../models/User');
     const user = await User.findById(req.user._id).select('cryptoAddresses');
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    const cached = (user.cryptoAddresses || []).find(a => a.paymentMethodId === paymentMethodId);
-    if (!cached) {
-      return res.status(400).json({ success: false, message: 'No deposit address issued for this network yet' });
+
+    const targets = selectAddressesToCheck(user.cryptoAddresses, paymentMethodId);
+    if (targets.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: paymentMethodId == null
+          ? 'No deposit addresses issued yet — generate one before checking'
+          : 'No deposit address issued for this network yet',
+      });
     }
 
-    // Pull latest deposits from Cryptrum (balance_sync=1 forces Cryptrum to
-    // refresh chain balances before responding).
-    const cryptrumData = await cryptrum.getDepositList({
-      uniqueId:        req.user._id.toString(),
-      paymentMethodId,
-      balanceSync:     1,
-    });
+    // ── (2) Reconcile each network in series ──────────────────────────
+    const credited        = [];
+    const skipped         = [];
+    const networksChecked = [];
+    const userIdStr       = req.user._id.toString();
 
-    const credited = [];
-    const skipped  = [];
-
-    for (const dep of (cryptrumData.deposits || [])) {
-      // Only credit confirmed deposits — Cryptrum returns status=0 for in-flight.
-      if (dep.status !== 1) { skipped.push({ txHash: dep.txHash, reason: 'unconfirmed' }); continue; }
-      if (!dep.txHash)      { skipped.push({ txHash: null,        reason: 'missing-txhash' }); continue; }
-
-      const chain = String(dep.networkName || cached.networkName || '').toUpperCase();
-      const gross = Number(dep.usdtAmount); // USD value Cryptrum already settled
-      if (!Number.isFinite(gross) || gross <= 0) {
-        skipped.push({ txHash: dep.txHash, reason: 'bad-amount' });
+    for (const cached of targets) {
+      let cryptrumData;
+      try {
+        cryptrumData = await cryptrum.getDepositList({
+          uniqueId:        userIdStr,
+          paymentMethodId: cached.paymentMethodId,
+          balanceSync:     1,
+        });
+      } catch (e) {
+        // One network's Cryptrum error must not abort the rest.
+        console.error('[checkDeposits] cryptrum getDepositList failed:', cached.paymentMethodId, e.message);
+        networksChecked.push({ paymentMethodId: cached.paymentMethodId, error: e.message });
         continue;
       }
 
-      // Commission resolution is read-only against settings collections and
-      // safe to do outside the transaction — values are captured at start.
-      const commSetting = await resolveCommission(req.user._id, 'deposit');
-      let fee = 0;
-      if (commSetting) {
-        fee = commSetting.rateType === 'percentage'
-          ? Math.round(gross * commSetting.rate / 100 * 100) / 100
-          : commSetting.rate;
-      }
-      const netCredit = Math.max(0, Math.round((gross - fee) * 100) / 100);
-      const txId      = 'CR-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+      networksChecked.push({
+        paymentMethodId: cached.paymentMethodId,
+        chain:           cached.networkName,
+        depositCount:    cryptrumData.deposits?.length || 0,
+      });
 
-      const session = await mongoose.startSession();
-      try {
-        let committed = false;
-        await session.withTransaction(async () => {
-          // (1) Deposit row — unique (chain, txHash) is the dedupe primitive.
-          // If a parallel request already inserted this thash, this throws
-          // E11000 and the whole transaction aborts before any wallet mutation.
-          await Deposit.create([{
-            userId:          req.user._id,
-            chain,
-            asset:           dep.name || cached.name || 'USDT',
-            amount:          netCredit,
-            txHash:          dep.txHash,
-            transactionId:   txId,
-            toAddress:       cached.address,
-            source:          'auto',
-            confirmations:   99,
-            requiredConfs:   0,
-            verifiedOnChain: true,
-            status:          'confirmed',
-            creditedAt:      new Date(),
-            notes:           `Cryptrum auto-credit (gross $${gross.toFixed(2)}, fee $${fee.toFixed(2)})`,
-          }], { session });
-
-          // (2) Credit wallet. Upsert is safe — if the wallet doc somehow
-          // doesn't exist yet (new user), this creates it with the credit.
-          const wallet = await Wallet.findOneAndUpdate(
-            { userId: req.user._id },
-            { $inc: { balance: netCredit }, $setOnInsert: { userId: req.user._id, locked: 0 } },
-            { session, new: true, upsert: true },
-          );
-
-          // (3) Audit row for wallet history.
-          await WalletTransaction.create([{
-            userId:        req.user._id,
-            walletId:      wallet._id,
-            type:          'deposit',
-            amount:        netCredit,
-            status:        'completed',
-            transactionId: txId,
-            chain,
-            txHash:        dep.txHash,
-            notes:         `Cryptrum ${chain} deposit`,
-            completedAt:   new Date(),
-          }], { session });
-
-          // (4) Commission ledger entry if a fee applied.
-          if (commSetting && fee > 0) {
-            await CommissionLedger.create([{
-              userId:           req.user._id,
-              transactionId:    txId,
-              type:             'deposit',
-              grossAmount:      gross,
-              commissionAmount: fee,
-              netAmount:        netCredit,
-              rateType:         commSetting.rateType,
-              rate:             commSetting.rate,
-            }], { session });
-          }
-
-          committed = true;
-        });
-
-        if (committed) {
-          credited.push({ txHash: dep.txHash, gross, fee, netCredit, chain, name: dep.name });
-        }
-      } catch (e) {
-        if (e && e.code === 11000) {
-          // Already credited by a prior call / parallel request — totally fine.
-          skipped.push({ txHash: dep.txHash, reason: 'already-credited' });
-        } else {
-          console.error('[Cryptrum checkDeposits tx failed]', dep.txHash, e.message);
-          skipped.push({ txHash: dep.txHash, reason: 'tx-failed', error: e.message });
-        }
-      } finally {
-        session.endSession();
+      for (const dep of (cryptrumData.deposits || [])) {
+        const outcome = await reconcileOneDeposit(req.user._id, userIdStr, dep, cached);
+        if (outcome.credited) credited.push(outcome.credited);
+        else                  skipped.push(outcome.skipped);
       }
     }
 
-    // Pull the resulting balance so the UI can refresh without a second call.
+    // ── (3) Final wallet snapshot for the UI ──────────────────────────
     const w = await Wallet.findOne({ userId: req.user._id }).select('balance locked');
 
     res.json({
@@ -211,18 +146,129 @@ exports.checkDeposits = async (req, res) => {
       credited,
       skipped,
       newBalance: w?.balance ?? null,
-      address:    cryptrumData.address || cached.address,
-      cryptrumTotals: {
-        totalDepositAmount: cryptrumData.totalDepositAmount,
-        verifiedDeposit:    cryptrumData.verifiedDeposit,
-        totalDeposit:       cryptrumData.totalDeposit,
-      },
+      networksChecked,
     });
   } catch (err) {
     console.error('[Cryptrum]', req.originalUrl, err.message);
     res.status(err.status || 502).json({ success: false, message: err.message || 'Failed to check deposits' });
   }
 };
+
+// Reconcile a single Cryptrum deposit row into the local wallet. Used by
+// `checkDeposits` once per (network × Cryptrum row). Returns either
+//   { credited: {...} }  — wallet was incremented
+// or
+//   { skipped:  { txHash, reason, ... } } — see reason codes below.
+//
+// Reason codes:
+//   unconfirmed / pending / queued-for-verification / hash-verified-awaiting-gas
+//   gas-transferred-awaiting-collect / failed   — see CRYPTRUM_DEPOSIT_STATUS
+//   missing-txhash    — Cryptrum returned a confirmed row with no txHash
+//   wrong-user        — uniqueId from Cryptrum did not match this user
+//   address-mismatch  — toAddress did not match the cached address
+//   bad-amount        — usdtAmount was not a positive finite number
+//   already-credited  — unique index hit; another caller credited it first
+//   tx-failed         — Mongo transaction errored
+async function reconcileOneDeposit(userId, userIdStr, dep, cached) {
+  // (a) Phase filter — only Cryptrum phase 1 (completed) is credit-able.
+  if (!dep.confirmed) {
+    return { skipped: { txHash: dep.txHash, reason: dep.statusCode || 'unconfirmed', label: dep.statusLabel } };
+  }
+  if (!dep.txHash) {
+    return { skipped: { txHash: null, reason: 'missing-txhash' } };
+  }
+
+  // (b) Ownership filter — uniqueId echo + toAddress match.
+  const own = verifyDepositOwnership(dep, userIdStr, cached);
+  if (!own.ok) {
+    return { skipped: { txHash: dep.txHash, reason: own.reason } };
+  }
+
+  // (c) Amount filter.
+  const gross = Number(dep.usdtAmount);
+  if (!Number.isFinite(gross) || gross <= 0) {
+    return { skipped: { txHash: dep.txHash, reason: 'bad-amount' } };
+  }
+
+  // (d) Commission (read-only — values captured before the tx starts).
+  const commSetting = await resolveCommission(userId, 'deposit');
+  const { fee, net: netCredit } = computeCommission(commSetting, gross);
+
+  const chain = String(dep.networkName || cached.networkName || '').toUpperCase();
+  const txId  = 'CR-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+
+  // (e) Atomic credit — Deposit + Wallet + WalletTransaction + Commission.
+  const session = await mongoose.startSession();
+  try {
+    let committed = false;
+    await session.withTransaction(async () => {
+      await Deposit.create([{
+        userId,
+        chain,
+        asset:           dep.name || cached.name || 'USDT',
+        amount:          netCredit,
+        txHash:          dep.txHash,
+        transactionId:   txId,
+        toAddress:       dep.toAddress || cached.address,
+        fromAddress:     dep.fromAddress || null,
+        source:          'auto',
+        confirmations:   99,
+        requiredConfs:   0,
+        verifiedOnChain: true,
+        status:          'confirmed',
+        creditedAt:      new Date(),
+        notes:           `Cryptrum auto-credit (gross $${gross.toFixed(2)}, fee $${fee.toFixed(2)})`,
+      }], { session });
+
+      const wallet = await Wallet.findOneAndUpdate(
+        { userId },
+        { $inc: { balance: netCredit }, $setOnInsert: { userId, locked: 0 } },
+        { session, new: true, upsert: true },
+      );
+
+      await WalletTransaction.create([{
+        userId,
+        walletId:      wallet._id,
+        type:          'deposit',
+        amount:        netCredit,
+        status:        'completed',
+        transactionId: txId,
+        chain,
+        txHash:        dep.txHash,
+        notes:         `Cryptrum ${chain} deposit`,
+        completedAt:   new Date(),
+      }], { session });
+
+      if (commSetting && fee > 0) {
+        await CommissionLedger.create([{
+          userId,
+          transactionId:    txId,
+          type:             'deposit',
+          grossAmount:      gross,
+          commissionAmount: fee,
+          netAmount:        netCredit,
+          rateType:         commSetting.rateType,
+          rate:             commSetting.rate,
+        }], { session });
+      }
+
+      committed = true;
+    });
+
+    if (committed) {
+      return { credited: { txHash: dep.txHash, gross, fee, netCredit, chain, name: dep.name } };
+    }
+    return { skipped: { txHash: dep.txHash, reason: 'tx-uncommitted' } };
+  } catch (e) {
+    if (e && e.code === 11000) {
+      return { skipped: { txHash: dep.txHash, reason: 'already-credited' } };
+    }
+    console.error('[checkDeposits credit tx failed]', dep.txHash, e.message);
+    return { skipped: { txHash: dep.txHash, reason: 'tx-failed', error: e.message } };
+  } finally {
+    session.endSession();
+  }
+}
 
 // GET /user/wallet/cryptrum/withdrawals — filtered to this user via reference_id
 // (we use Mongo Withdrawal._id as reference_id when pushing to Cryptrum).
@@ -475,13 +521,93 @@ exports.submitStaticDeposit = async (req, res) => {
   }
 };
 
-// GET /user/wallet/deposit/status/:txHash
+// GET /user/wallet/deposit/status/:txHash[?paymentMethodId=&live=true]
+//
+// Default: cheap local-DB lookup against the Deposit collection (set by
+// `checkDeposits` once the deposit has been credited).
+//
+// With `?live=true&paymentMethodId=<n>`: also queries Cryptrum's /deposit-list
+// filtered to this txHash so the user can see in-flight phases (Pending /
+// Queued for Verification / Hash Verified / Gas Transferred / Failed) before
+// the local row exists. `paymentMethodId` is required because Cryptrum scopes
+// the listing by uniqueId × paymentMethodId.
 exports.depositStatus = async (req, res) => {
   try {
-    const deposit = await Deposit.findOne({ txHash: req.params.txHash, userId: req.user._id });
-    if (!deposit) return res.status(404).json({ success: false, message: 'Deposit not found' });
-    res.json({ success: true, status: deposit.status, confirmations: deposit.confirmations, required: deposit.requiredConfs });
+    const { txHash } = req.params;
+    const wantLive   = req.query.live === 'true' || req.query.live === '1';
+    const paymentMethodId = Number(req.query.paymentMethodId);
+
+    const local = await Deposit.findOne({ txHash, userId: req.user._id });
+
+    // Local row already in a terminal credit state — no need to call Cryptrum.
+    const terminalLocal = local && ['confirmed', 'completed', 'rejected'].includes(local.status);
+    if (terminalLocal && !wantLive) {
+      return res.json({
+        success: true,
+        source: 'local',
+        status: local.status,
+        confirmations: local.confirmations,
+        required: local.requiredConfs,
+      });
+    }
+
+    if (!local && !wantLive) {
+      return res.status(404).json({ success: false, message: 'Deposit not found' });
+    }
+
+    // Live lookup against Cryptrum (only if explicitly requested or local is non-terminal).
+    if (wantLive) {
+      if (!Number.isInteger(paymentMethodId) || paymentMethodId <= 0) {
+        return res.status(400).json({ success: false, message: 'paymentMethodId is required for live=true' });
+      }
+
+      const { deposits } = await cryptrum.getDepositList({
+        uniqueId:        req.user._id.toString(),
+        paymentMethodId,
+        balanceSync:     1,
+        thash:           txHash,
+      });
+      const remote = (deposits || []).find(d => d.txHash === txHash) || null;
+
+      if (!remote && !local) {
+        return res.status(404).json({ success: false, message: 'Deposit not found on Cryptrum or locally' });
+      }
+
+      return res.json({
+        success: true,
+        source: remote ? 'cryptrum' : 'local',
+        // Cryptrum phase (0..5) — only present when remote row was returned.
+        cryptrum: remote ? {
+          status:      remote.status,
+          statusCode:  remote.statusCode,
+          statusLabel: remote.statusLabel,
+          confirmed:   remote.confirmed,
+          terminal:    remote.terminal,
+        } : null,
+        // Local credit state — present once checkDeposits has credited the wallet.
+        local: local ? {
+          status:        local.status,
+          confirmations: local.confirmations,
+          required:      local.requiredConfs,
+          amount:        local.amount,
+          chain:         local.chain,
+          creditedAt:    local.creditedAt,
+        } : null,
+      });
+    }
+
+    // Local row exists but not terminal — caller can poll again.
+    return res.json({
+      success: true,
+      source: 'local',
+      status: local.status,
+      confirmations: local.confirmations,
+      required: local.requiredConfs,
+    });
   } catch (err) {
+    if (err.status === 502) {
+      return res.status(502).json({ success: false, message: err.message });
+    }
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
@@ -561,9 +687,12 @@ exports.initiateWithdraw = async (req, res) => {
     if (!addrResult.ok) return res.status(400).json({ success: false, message: addrResult.error });
     const toAddress = addrResult.address;
 
-    // Commission resolution (read-only — uses the validated, rounded amount)
-    let commSetting = await UserCommissionSetting.findOne({ userId: req.user._id, type: 'withdrawal' });
-    if (!commSetting) commSetting = await CommissionSetting.findOne({ type: 'withdrawal' });
+    // Commission resolution — must use the 3-layer resolver (user → merchant
+    // → global). A previous inline lookup here skipped the merchant tier, so
+    // MerchantCommissionSetting overrides for `withdrawal` were silently
+    // inert. resolveCommission is the single read path documented in
+    // lib/commissionResolver.js — all fee-calculation sites must go through it.
+    const commSetting = await resolveCommission(req.user._id, 'withdrawal');
     let fee = 0;
     if (commSetting) {
       fee = commSetting.rateType === 'percentage'
@@ -633,48 +762,81 @@ exports.initiateWithdraw = async (req, res) => {
       });
     }
 
-    // Provider accepted the payout: promote to `approved`, save the code so
-    // refreshWithdrawalStatus can poll it, and release the lock — those funds
-    // are now in Cryptrum's hands, not ours.
-    withdrawal.status       = 'approved';
-    withdrawal.cryptrumCode = cryptrumResp.withdrawCode || null;
-    await withdrawal.save();
-
-    await Wallet.findOneAndUpdate(
-      { userId: req.user._id, locked: { $gte: amount } },
-      { $inc: { locked: -amount } },
-    );
-
+    // Provider accepted the payout: funds are now Cryptrum's responsibility,
+    // so the lock MUST be released even if our subsequent bookkeeping fails.
+    // A half-applied save would otherwise strand the user's funds in `locked`
+    // while Cryptrum continues processing the payout. Wrap the post-push
+    // steps so the lock release and cryptrumCode persistence always run.
+    const cryptrumCode = cryptrumResp.withdrawCode || null;
     const txId = crypto.randomBytes(16).toString('hex');
-    await WalletTransaction.create({
-      userId: req.user._id,
-      walletId: wallet._id,
-      type: 'withdraw',
-      amount,
-      status: 'approved',
-      transactionId: txId,
-      referenceId: withdrawal._id.toString(),
-      chain,
-    });
+    let reconciliationWarning = null;
 
-    if (commSetting && fee > 0) {
-      await CommissionLedger.create({
+    try {
+      withdrawal.status       = 'approved';
+      withdrawal.cryptrumCode = cryptrumCode;
+      await withdrawal.save();
+
+      await Wallet.findOneAndUpdate(
+        { userId: req.user._id, locked: { $gte: amount } },
+        { $inc: { locked: -amount } },
+      );
+
+      await WalletTransaction.create({
         userId: req.user._id,
+        walletId: wallet._id,
+        type: 'withdraw',
+        amount,
+        status: 'approved',
         transactionId: txId,
-        type: 'withdrawal',
-        grossAmount: amount,
-        commissionAmount: fee,
-        netAmount,
-        rateType: commSetting.rateType,
-        rate: commSetting.rate,
+        referenceId: withdrawal._id.toString(),
+        chain,
       });
+
+      if (commSetting && fee > 0) {
+        await CommissionLedger.create({
+          userId: req.user._id,
+          transactionId: txId,
+          type: 'withdrawal',
+          grossAmount: amount,
+          commissionAmount: fee,
+          netAmount,
+          rateType: commSetting.rateType,
+          rate: commSetting.rate,
+        });
+      }
+    } catch (postPushErr) {
+      // Money already left to Cryptrum — DO NOT refund. Recover what we can
+      // and surface a soft warning so ops can reconcile.
+      console.error('[initiateWithdraw post-push] code=', cryptrumCode, 'err=', postPushErr);
+      reconciliationWarning = 'Post-push reconciliation partially failed; ops will reconcile.';
+
+      // Persist cryptrumCode no matter what — refreshWithdrawalStatus needs it.
+      try {
+        await Withdrawal.updateOne(
+          { _id: withdrawal._id },
+          { $set: { status: 'approved', cryptrumCode } },
+        );
+      } catch (e) {
+        console.error('[initiateWithdraw post-push] Withdrawal save retry failed', e.message);
+      }
+
+      // Always release the lock — funds are no longer ours to hold.
+      try {
+        await Wallet.findOneAndUpdate(
+          { userId: req.user._id, locked: { $gte: amount } },
+          { $inc: { locked: -amount } },
+        );
+      } catch (e) {
+        console.error('[initiateWithdraw post-push] Lock release failed', e.message);
+      }
     }
 
     res.json({
       success: true,
       message: 'Withdrawal submitted to Cryptrum for on-chain processing',
       withdrawalId: withdrawal._id,
-      cryptrumCode: withdrawal.cryptrumCode,
+      cryptrumCode,
+      reconciliationWarning,
     });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
@@ -685,13 +847,19 @@ exports.initiateWithdraw = async (req, res) => {
 //
 // For each of this user's withdrawals that has been pushed to Cryptrum
 // (status=approved/processing, cryptrumCode set), query /withdraw-list and
-// transition the local row to `completed` when Cryptrum reports status=1.
+// transition the local row based on the Cryptrum phase:
+//   completed (1)              → status='completed' + txHash
+//   unsuccessful (6)           → status='failed'    + refund balance
+//   cancelled (7)              → status='rejected'  + refund balance
+//   anything else (0/2/3/4/5)  → still in flight, leave alone
 //
-// Race-safe — the local Withdrawal update uses a precondition
-// (`status: { $ne: 'completed' }`) so two parallel callers can't both
-// flip the row to completed. The WalletTransaction `$set` is idempotent.
-// Locked funds were already released at approval time, so no wallet
-// mutation is required on the completion transition.
+// Race-safety: every state transition uses a Withdrawal precondition
+// (`status: { $in: ['approved', 'processing'] }`) so two parallel callers
+// cannot both win the same transition — only one increments balance, only
+// one writes the WalletTransaction terminal state. The completion path
+// requires no wallet mutation (locked already released at approval); the
+// failed/cancelled paths refund $amount back to balance from Cryptrum's
+// retained funds.
 exports.refreshWithdrawalStatus = async (req, res) => {
   try {
     const withdrawals = await Withdrawal.find({
@@ -715,15 +883,12 @@ exports.refreshWithdrawalStatus = async (req, res) => {
       const item = (cryptrumData.withdrawals || [])[0];
       if (!item) continue;
 
-      // Cryptrum: status=1 means processed/sent. thash_verify=1 means we
-      // also have an on-chain hash confirmed. Treat status=1 as final.
-      if (Number(item.status) === 1) {
-        const txHash = item.txHash || null;
+      const txHash = item.txHash || null;
 
-        // Idempotent state transition — only the call that flips
-        // pending→completed gets the row; others get null.
+      // ── Completed (Cryptrum status 1) ─────────────────────────────────
+      if (item.completed) {
         const w2 = await Withdrawal.findOneAndUpdate(
-          { _id: w._id, status: { $ne: 'completed' } },
+          { _id: w._id, status: { $in: ['approved', 'processing'] } },
           { $set: { status: 'completed', txHash, processedAt: new Date() } },
           { new: true },
         );
@@ -732,9 +897,57 @@ exports.refreshWithdrawalStatus = async (req, res) => {
             { referenceId: w._id.toString() },
             { $set: { status: 'completed', txHash, completedAt: new Date() } },
           );
-          updated.push({ id: String(w._id), status: 'completed', txHash });
+          updated.push({ id: String(w._id), status: 'completed', statusCode: item.statusCode, txHash });
         }
+        continue;
       }
+
+      // ── Unsuccessful / Cancelled (Cryptrum status 6 or 7) ─────────────
+      // Both are terminal-non-completed. Cryptrum still holds the funds
+      // because the on-chain payout did not go through, so we credit the
+      // user's wallet balance back.
+      if (item.failed || item.cancelled) {
+        const newStatus = item.cancelled ? 'rejected' : 'failed';
+        const reason    = item.cancelled ? 'Cancelled by provider' : 'Provider reported unsuccessful';
+
+        // Atomic transition — wins only if row hasn't already been moved.
+        const w2 = await Withdrawal.findOneAndUpdate(
+          { _id: w._id, status: { $in: ['approved', 'processing'] } },
+          {
+            $set: {
+              status:          newStatus,
+              rejectionReason: reason,
+              processedAt:     new Date(),
+              txHash,
+            },
+          },
+          { new: true },
+        );
+        if (!w2) continue; // someone else already transitioned this row.
+
+        // Refund the wallet — funds were debited at submission, Cryptrum
+        // is not sending them out, so they come back to balance.
+        try {
+          await Wallet.findOneAndUpdate(
+            { userId: req.user._id },
+            { $inc: { balance: w.amount } },
+          );
+        } catch (e) {
+          // Critical alert: row already marked terminal but refund failed.
+          // Leave for ops reconciliation rather than rolling back the status.
+          console.error('[refreshWithdrawalStatus] REFUND FAILED', w._id.toString(), e.message);
+        }
+
+        await WalletTransaction.findOneAndUpdate(
+          { referenceId: w._id.toString() },
+          { $set: { status: newStatus, completedAt: new Date(), notes: reason } },
+        );
+
+        updated.push({ id: String(w._id), status: newStatus, statusCode: item.statusCode, refunded: w.amount });
+        continue;
+      }
+
+      // ── In-flight (0/2/3/4/5) — caller should re-poll ─────────────────
     }
 
     res.json({ success: true, checked: withdrawals.length, updated });
@@ -744,12 +957,68 @@ exports.refreshWithdrawalStatus = async (req, res) => {
   }
 };
 
-// GET /user/wallet/withdrawal/status/:id
+// GET /user/wallet/withdrawal/status/:id[?live=true]
+//
+// Default: local-DB read. Returns whatever refreshWithdrawalStatus last
+// persisted (status, txHash).
+//
+// With `?live=true`: also queries Cryptrum /withdraw-list by cryptrumCode and
+// returns the live phase (0..7) alongside the local row. Useful while a
+// withdrawal is in-flight (status=approved/processing) and the user wants to
+// see the exact Cryptrum stage (e.g., "Awaiting Blockchain Confirmation")
+// without invoking the bulk refresh-status endpoint.
 exports.withdrawalStatus = async (req, res) => {
   try {
     const withdrawal = await Withdrawal.findOne({ _id: req.params.id, userId: req.user._id });
     if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
-    res.json({ success: true, status: withdrawal.status, txHash: withdrawal.txHash });
+
+    const wantLive = req.query.live === 'true' || req.query.live === '1';
+
+    if (!wantLive || !withdrawal.cryptrumCode) {
+      return res.json({
+        success: true,
+        source: 'local',
+        status: withdrawal.status,
+        txHash: withdrawal.txHash,
+      });
+    }
+
+    let cryptrumData;
+    try {
+      cryptrumData = await cryptrum.getWithdrawList({ code: withdrawal.cryptrumCode });
+    } catch (e) {
+      // Upstream failure — fall back to local so the caller still gets useful info.
+      return res.json({
+        success: true,
+        source: 'local',
+        status: withdrawal.status,
+        txHash: withdrawal.txHash,
+        liveError: e.message,
+      });
+    }
+
+    const item = (cryptrumData.withdrawals || [])[0] || null;
+    return res.json({
+      success: true,
+      source: item ? 'cryptrum' : 'local',
+      local: {
+        status: withdrawal.status,
+        txHash: withdrawal.txHash,
+        amount: withdrawal.amount,
+        chain:  withdrawal.chain,
+      },
+      cryptrum: item ? {
+        status:         item.status,
+        statusCode:     item.statusCode,
+        statusLabel:    item.statusLabel,
+        completed:      item.completed,
+        failed:         item.failed,
+        cancelled:      item.cancelled,
+        terminal:       item.terminal,
+        txHash:         item.txHash,
+        txHashVerified: item.txHashVerified,
+      } : null,
+    });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
