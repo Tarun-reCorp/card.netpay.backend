@@ -5,6 +5,8 @@ const qrcode = require('qrcode');
 const User = require('../../models/User');
 const Wallet = require('../../models/Wallet');
 const Merchant = require('../../models/Merchant');
+const { presign } = require('../../lib/s3');
+const { userBrandSummary, MERCHANT_BRAND_SELECT } = require('../../lib/userBrand');
 
 const SETUP_TOKEN_TTL     = '15m';
 const MFA_CHALLENGE_TTL   = '5m';
@@ -46,6 +48,10 @@ function verifyMfaChallengeToken(token) {
   }
 }
 
+// Legacy summary used when the user doc was loaded without populating the
+// merchant. Prefer `userBrandSummary` (from lib/userBrand) for any new code
+// — it returns the full payload with the merchant brand block, which the
+// frontend Layout needs to theme on the first render after login.
 function userSummary(u) {
   return { id: u._id, name: u.name, email: u.email, kycStatus: u.kycStatus };
 }
@@ -66,12 +72,16 @@ exports.register = async (req, res) => {
     }
 
     const hashed = await bcrypt.hash(password, 12);
-    const user = await User.create({ name, email, password: hashed, firstName, lastName, birthday, gender, country, countryName, phone, areaCode, mobile, town, address, postCode, merchantId: resolvedMerchantId });
+    const created = await User.create({ name, email, password: hashed, firstName, lastName, birthday, gender, country, countryName, phone, areaCode, mobile, town, address, postCode, merchantId: resolvedMerchantId });
 
-    await Wallet.create({ userId: user._id });
+    await Wallet.create({ userId: created._id });
+
+    // Re-load with merchant populated so the response carries brand fields
+    // — frontend can theme the dashboard on the very first render.
+    const user = await User.findById(created._id).populate({ path: 'merchantId', select: MERCHANT_BRAND_SELECT });
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN });
-    res.status(201).json({ success: true, token, user: { id: user._id, name: user.name, email: user.email } });
+    res.status(201).json({ success: true, token, user: await userBrandSummary(user) });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
@@ -81,12 +91,19 @@ exports.register = async (req, res) => {
 exports.getMerchantBrand = async (req, res) => {
   try {
     const merchant = await Merchant.findOne({ tag: req.params.tag.toLowerCase(), status: 'active' })
-      .select('name tag logo primaryColor secondaryColor titleTag showPoweredBy type');
+      .select('name tag logo cardImage primaryColor secondaryColor titleTag showPoweredBy type');
     if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
 
     const data = merchant.toObject();
     // Whitelabel merchants never show "Powered by NetPay" (mirrors PHP Merchant::showPoweredBy())
     if (data.type === 'whitelabel') data.showPoweredBy = false;
+
+    // The frontend used to construct logo URLs by prepending UPLOADS_BASE to
+    // a local path, but logos now live in S3 as opaque object keys. Replace
+    // the key with a 1h presigned GET URL so <img src> works without any
+    // path-joining gymnastics on the client.
+    data.logo      = await presign(data.logo);
+    data.cardImage = await presign(data.cardImage);
 
     res.json({ success: true, merchant: data });
   } catch (err) {
@@ -95,6 +112,12 @@ exports.getMerchantBrand = async (req, res) => {
 };
 
 // POST /auth/login
+//
+// Accepts an optional `merchantTag` body param. When present, the login is
+// scoped to that merchant's white-label portal — only users whose
+// `merchantId.tag` matches are allowed through. This prevents merchant A's
+// user from signing in via merchant B's URL (`/{tagB}`) and direct users
+// (no merchantId) from bleeding into any merchant portal.
 exports.login = async (req, res) => {
   try {
     // Belt-and-braces coercion. The sanitizeMongo middleware already strips
@@ -103,14 +126,60 @@ exports.login = async (req, res) => {
     // changes elsewhere.
     const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : null;
     const password = typeof req.body?.password === 'string' ? req.body.password : null;
+    const merchantTag = typeof req.body?.merchantTag === 'string'
+      ? req.body.merchantTag.trim().toLowerCase()
+      : null;
     if (!email || !password) return res.status(400).json({ success: false, message: 'Email and password are required' });
 
-    const user = await User.findOne({ email });
+    // Populate the merchant brand inline so the success response carries
+    // primary/secondary colors + presigned logoUrl — avoids a /user/profile
+    // round-trip and the resulting flicker on the frontend.
+    const user = await User.findOne({ email }).populate({
+      path: 'merchantId',
+      select: MERCHANT_BRAND_SELECT,
+    });
     if (!user) return res.status(401).json({ success: false, message: 'Invalid credentials' });
     if (user.isBlocked) return res.status(403).json({ success: false, message: 'Account blocked' });
 
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+    // Merchant-portal scoping. Done after the password check so the error
+    // message can't be used to enumerate which emails belong to which merchant.
+    //
+    // Two-way gate:
+    //   • merchantTag given but user.merchantId missing → reject (direct user
+    //     trying to sign in via a whitelabel portal)
+    //   • merchantTag given but doesn't match user.merchantId.tag → reject
+    //     (cross-merchant login attempt)
+    //   • merchantTag NOT given but user.merchantId is set → reject and point
+    //     them to their own portal (prevents the generic /login from
+    //     bypassing whitelabel scoping)
+    // Merchant scoping: `user.merchantId` is the populated merchant doc here
+    // (or null when user has no merchant).
+    const userMerchant = user.merchantId;
+    if (merchantTag) {
+      if (!userMerchant) {
+        return res.status(403).json({
+          success: false,
+          message: 'This account is not registered under this merchant portal',
+        });
+      }
+      const mTag = (userMerchant.tag || '').toLowerCase();
+      if (mTag !== merchantTag) {
+        return res.status(403).json({
+          success: false,
+          message: 'This account belongs to a different merchant portal',
+        });
+      }
+    } else if (userMerchant) {
+      const portalHint = userMerchant.tag ? ` Please sign in at /${userMerchant.tag}.` : '';
+      return res.status(403).json({
+        success: false,
+        message: `This account belongs to a merchant portal.${portalHint}`,
+        merchantTag: userMerchant.tag || null,
+      });
+    }
 
     if (user.twoFactorEnabled && user.twoFactorSecret) {
       // Return an opaque challenge token instead of the raw userId so the
@@ -132,7 +201,7 @@ exports.login = async (req, res) => {
       });
     }
 
-    res.json({ success: true, token: issueAuthToken(user._id), user: userSummary(user) });
+    res.json({ success: true, token: issueAuthToken(user._id), user: await userBrandSummary(user) });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
@@ -153,7 +222,9 @@ exports.verify2FA = async (req, res) => {
     const userId = verifyMfaChallengeToken(mfaChallengeToken);
     if (!userId) return res.status(401).json({ success: false, message: 'Invalid or expired challenge token' });
 
-    const user = await User.findById(userId);
+    // Populate merchant brand here too so the post-2FA login response carries
+    // the same payload as the no-2FA path — frontend treats them uniformly.
+    const user = await User.findById(userId).populate({ path: 'merchantId', select: MERCHANT_BRAND_SELECT });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     if (!user.twoFactorEnabled || !user.twoFactorSecret) {
       return res.status(400).json({ success: false, message: '2FA is not enabled for this account' });
@@ -164,7 +235,7 @@ exports.verify2FA = async (req, res) => {
     });
     if (!valid) return res.status(401).json({ success: false, message: 'Invalid 2FA code' });
 
-    res.json({ success: true, token: issueAuthToken(user._id), user: userSummary(user) });
+    res.json({ success: true, token: issueAuthToken(user._id), user: await userBrandSummary(user) });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
@@ -214,7 +285,7 @@ exports.enable2FAForced = async (req, res) => {
     const userId = verifySetupToken(setupToken);
     if (!userId) return res.status(401).json({ success: false, message: 'Invalid or expired setup token' });
 
-    const user = await User.findById(userId);
+    const user = await User.findById(userId).populate({ path: 'merchantId', select: MERCHANT_BRAND_SELECT });
     if (!user || !user.twoFactorSecret) {
       return res.status(400).json({ success: false, message: 'Run setup first' });
     }
@@ -225,7 +296,7 @@ exports.enable2FAForced = async (req, res) => {
     if (!valid) return res.status(401).json({ success: false, message: 'Invalid code' });
 
     await User.findByIdAndUpdate(user._id, { twoFactorEnabled: true });
-    res.json({ success: true, token: issueAuthToken(user._id), user: userSummary(user) });
+    res.json({ success: true, token: issueAuthToken(user._id), user: await userBrandSummary(user) });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }

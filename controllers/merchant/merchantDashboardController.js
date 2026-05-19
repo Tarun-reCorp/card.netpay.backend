@@ -1,6 +1,7 @@
 const User = require('../../models/User');
 const Card = require('../../models/Card');
 const PhysicalCardNumber = require('../../models/PhysicalCardNumber');
+const { merchantBrandSummary } = require('../../lib/merchantBrand');
 
 // GET /merchant/dashboard
 exports.dashboard = async (req, res) => {
@@ -21,13 +22,12 @@ exports.dashboard = async (req, res) => {
 exports.profile = async (req, res) => {
   try {
     const m = req.merchant;
+    const brand = await merchantBrandSummary(m);
     res.json({
       success: true,
-      merchant: {
-        id: m._id, name: m.name, email: m.email,
-        phone: m.phone, status: m.status, tag: m.tag,
-        createdAt: m.createdAt,
-      },
+      // brand includes id, name, email, phone, status, tag, type, titleTag,
+      // showPoweredBy, primaryColor, secondaryColor, logoUrl, cardImageUrl.
+      merchant: { ...brand, createdAt: m.createdAt },
     });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });

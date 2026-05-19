@@ -31,6 +31,11 @@ function parseAllowList() {
 // edit .env every time they switch Vite ports.
 const DEV_LOCAL_RE = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
 
+// Dev tunnels — Microsoft devtunnels.ms, ngrok, Cloudflare quick tunnels.
+// URLs rotate every session so we cannot pin them in .env. Dev-only.
+// Matches any subdomain depth (e.g. tunnel-5173.region.devtunnels.ms).
+const DEV_TUNNEL_RE = /^https:\/\/[a-z0-9.-]+\.(devtunnels\.ms|ngrok-free\.app|ngrok\.io|trycloudflare\.com|loca\.lt)$/i;
+
 function buildCorsOptions() {
   const allowList = parseAllowList();
   const isDev = process.env.NODE_ENV !== 'production';
@@ -45,6 +50,9 @@ function buildCorsOptions() {
 
       // Dev convenience: any localhost origin passes without env config.
       if (isDev && DEV_LOCAL_RE.test(origin)) return callback(null, true);
+
+      // Dev tunnels (devtunnels.ms / ngrok / cloudflare / localtunnel).
+      if (isDev && DEV_TUNNEL_RE.test(origin)) return callback(null, true);
 
       // Wildcard accepted only in non-production environments.
       if (isDev && allowList.includes('*')) return callback(null, true);

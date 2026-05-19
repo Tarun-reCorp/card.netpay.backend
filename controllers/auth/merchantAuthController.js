@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const speakeasy = require('speakeasy');
 const qrcode = require('qrcode');
 const Merchant = require('../../models/Merchant');
+const { merchantBrandSummary } = require('../../lib/merchantBrand');
 
 const SETUP_TOKEN_TTL   = '15m';
 const MFA_CHALLENGE_TTL = '5m';
@@ -51,8 +52,12 @@ function verifyMfaChallengeToken(token) {
   }
 }
 
-function merchantSummary(m) {
-  return { id: m._id, name: m.name, email: m.email };
+// Auth-response summary. Includes brand fields (primary/secondary colors,
+// presigned logo+cardImage URLs, titleTag, type, showPoweredBy) so that
+// MerchantLayout on the frontend can theme the portal as soon as the session
+// is stored — no extra round-trip needed.
+async function merchantSummary(m) {
+  return merchantBrandSummary(m);
 }
 
 // POST /merchant/auth/login
@@ -88,7 +93,7 @@ exports.login = async (req, res) => {
       });
     }
 
-    res.json({ success: true, token: issueAuthToken(merchant._id), merchant: merchantSummary(merchant) });
+    res.json({ success: true, token: issueAuthToken(merchant._id), merchant: await merchantSummary(merchant) });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
@@ -115,7 +120,7 @@ exports.verify2FA = async (req, res) => {
     });
     if (!valid) return res.status(401).json({ success: false, message: 'Invalid 2FA code' });
 
-    res.json({ success: true, token: issueAuthToken(merchant._id), merchant: merchantSummary(merchant) });
+    res.json({ success: true, token: issueAuthToken(merchant._id), merchant: await merchantSummary(merchant) });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
@@ -174,7 +179,7 @@ exports.enable2FA = async (req, res) => {
 
     await Merchant.findByIdAndUpdate(merchant._id, { twoFactorEnabled: true });
 
-    res.json({ success: true, token: issueAuthToken(merchant._id), merchant: merchantSummary(merchant) });
+    res.json({ success: true, token: issueAuthToken(merchant._id), merchant: await merchantSummary(merchant) });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
   }
