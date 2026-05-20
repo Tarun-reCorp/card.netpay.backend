@@ -1787,30 +1787,27 @@ exports.createUserCryptoAddress = async (req, res) => {
 
 // GET /admin/users/:id/cryptrum-deposits
 //
-// Admin view of a user's full Cryptrum deposit-list aggregated across every
-// payment method they have a cached address for. Mirrors the user-side
-// `/wallet/cryptrum/deposits/all` route but scoped by `:id` so admin can
-// inspect any user's pending / queued / failed Cryptrum entries — useful when
-// a deposit is reported missing or stuck and never made it into the local
-// `deposits` collection because `/deposit/check` discards non-credit-able
-// phases. One method's transient failure must not fail the whole request, so
-// individual chains are isolated with Promise.allSettled.
+// Admin view of a user's full Cryptrum deposit-list across every active
+// deposit method (not just methods the user has cached) — mirrors the
+// user-side `/wallet/cryptrum/deposits/all` simplification so cross-asset /
+// cross-family deposits surface here too.
 exports.cryptrumDepositsForUser = async (req, res) => {
   try {
     const cryptrum = require('../../services/CryptrumService');
-    const user = await User.findById(req.params.id).select('cryptoAddresses email name');
+    const user = await User.findById(req.params.id).select('email name');
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
-    const targets = (user.cryptoAddresses || []).filter(a => a.paymentMethodId && a.address);
-    if (targets.length === 0) {
+    const uniqueId = user._id.toString();
+    const { items } = await cryptrum.getPaymentMethods('deposit');
+    const methods = items.filter(m => m.depositEnabled);
+    if (methods.length === 0) {
       return res.json({ success: true, deposits: [], user: { _id: user._id, email: user.email, name: user.name } });
     }
 
-    const uniqueId = user._id.toString();
     const results = await Promise.allSettled(
-      targets.map(t => cryptrum.getDepositList({
+      methods.map(m => cryptrum.getDepositList({
         uniqueId,
-        paymentMethodId: t.paymentMethodId,
+        paymentMethodId: m.id,
         balanceSync:     1,
       })),
     );
@@ -1822,13 +1819,13 @@ exports.cryptrumDepositsForUser = async (req, res) => {
         for (const dep of r.value.deposits) {
           flat.push({
             ...dep,
-            paymentMethodId: targets[i].paymentMethodId,
-            chain:           targets[i].networkName,
-            asset:           targets[i].name,
+            paymentMethodId: methods[i].id,
+            chain:           methods[i].networkName,
+            asset:           methods[i].name,
           });
         }
       } else if (r.status === 'rejected') {
-        console.warn('[admin.cryptrumDepositsForUser] method', targets[i].paymentMethodId, 'failed:', r.reason?.message);
+        console.warn('[admin.cryptrumDepositsForUser] method', methods[i].id, 'failed:', r.reason?.message);
       }
     }
 

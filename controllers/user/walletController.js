@@ -65,26 +65,22 @@ exports.cryptrumDeposits = async (req, res) => {
 
 // GET /user/wallet/cryptrum/deposits/all
 //
-// Aggregated deposit-list across every payment method the user has cached.
-// Surfaces non-credit-able phases (pending / queued / failed / etc.) which
-// `/deposit/check` discards via the `skipped[]` array and never persists.
-// This is the data source for the "Pending & failed" panel on the Deposit
-// page. Single per-method failures don't fail the request — Promise.allSettled
-// keeps partial results so one chain being down still shows the others.
+// Aggregated deposit-list across every active payment method Cryptrum knows
+// about for this user. Surfaces all phases (pending / queued / completed /
+// failed) — used by the user's "Cryptrum activity" panel and the admin's
+// per-user Crypto tab. Does NOT filter by user.cryptoAddresses; queries every
+// active deposit method so cross-asset / cross-family sends are caught.
 exports.cryptrumDepositsAll = async (req, res) => {
   try {
-    const User = require('../../models/User');
-    const user = await User.findById(req.user._id).select('cryptoAddresses');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-
-    const targets = (user.cryptoAddresses || []).filter(a => a.paymentMethodId && a.address);
-    if (targets.length === 0) return res.json({ success: true, deposits: [] });
-
     const uniqueId = req.user._id.toString();
+    const { items } = await cryptrum.getPaymentMethods('deposit');
+    const methods = items.filter(m => m.depositEnabled);
+    if (methods.length === 0) return res.json({ success: true, deposits: [] });
+
     const results = await Promise.allSettled(
-      targets.map(t => cryptrum.getDepositList({
+      methods.map(m => cryptrum.getDepositList({
         uniqueId,
-        paymentMethodId: t.paymentMethodId,
+        paymentMethodId: m.id,
         balanceSync:     1,
       })),
     );
@@ -96,13 +92,13 @@ exports.cryptrumDepositsAll = async (req, res) => {
         for (const dep of r.value.deposits) {
           flat.push({
             ...dep,
-            paymentMethodId: targets[i].paymentMethodId,
-            chain:           targets[i].networkName,
-            asset:           targets[i].name,
+            paymentMethodId: methods[i].id,
+            chain:           methods[i].networkName,
+            asset:           methods[i].name,
           });
         }
       } else if (r.status === 'rejected') {
-        console.warn('[cryptrumDepositsAll] method', targets[i].paymentMethodId, 'failed:', r.reason?.message);
+        console.warn('[cryptrumDepositsAll] method', methods[i].id, 'failed:', r.reason?.message);
       }
     }
 
@@ -133,7 +129,6 @@ exports.cryptrumDepositsAll = async (req, res) => {
 //      rest see `already-credited` in their `skipped[]` and silently move on.
 exports.checkDeposits = async (req, res) => {
   try {
-    // ── (1) Validate & resolve target networks ────────────────────────
     const paymentMethodId = req.body.paymentMethodId == null
       ? null
       : Number(req.body.paymentMethodId);
@@ -141,44 +136,63 @@ exports.checkDeposits = async (req, res) => {
       return res.status(400).json({ success: false, message: 'paymentMethodId must be a positive integer' });
     }
 
+    const userIdStr = req.user._id.toString();
+
+    // Query EVERY active deposit method Cryptrum advertises (or the single
+    // pinned one). user.cryptoAddresses is read only as a hint for which
+    // entry to pass into reconcileOneDeposit — but we do NOT filter Cryptrum
+    // queries by it. Cryptrum monitors deposits per (uniqueId ×
+    // paymentMethodId) regardless of whether our app has cached an address
+    // for that method, so cross-asset / cross-family sends (e.g. TRC20 from
+    // a user whose UI only ever opened BNB) still get surfaced and credited.
+    const { items } = await cryptrum.getPaymentMethods('deposit');
+    let methods = items.filter(m => m.depositEnabled);
+    if (paymentMethodId != null) {
+      methods = methods.filter(m => m.id === paymentMethodId);
+      if (methods.length === 0) {
+        return res.status(400).json({ success: false, message: 'Unknown or inactive payment method' });
+      }
+    }
+
     const User = require('../../models/User');
     const user = await User.findById(req.user._id).select('cryptoAddresses');
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    const cachedByMethod = new Map(
+      (user.cryptoAddresses || []).map(a => [a.paymentMethodId, a]),
+    );
 
-    const targets = selectAddressesToCheck(user.cryptoAddresses, paymentMethodId);
-    if (targets.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: paymentMethodId == null
-          ? 'No deposit addresses issued yet — generate one before checking'
-          : 'No deposit address issued for this network yet',
-      });
-    }
-
-    // ── (2) Reconcile each network in series ──────────────────────────
     const credited        = [];
     const skipped         = [];
     const networksChecked = [];
-    const userIdStr       = req.user._id.toString();
 
-    for (const cached of targets) {
+    for (const m of methods) {
+      // Use the cached entry if we have one (carries the user's actual
+      // deposit address for ownership verification); otherwise synthesise a
+      // minimal stand-in from the method metadata.
+      const cached = cachedByMethod.get(m.id) || {
+        paymentMethodId: m.id,
+        networkName:     m.networkName,
+        networkType:     m.networkType,
+        name:            m.name,
+        address:         null,
+      };
+
       let cryptrumData;
       try {
         cryptrumData = await cryptrum.getDepositList({
           uniqueId:        userIdStr,
-          paymentMethodId: cached.paymentMethodId,
+          paymentMethodId: m.id,
           balanceSync:     1,
         });
       } catch (e) {
-        // One network's Cryptrum error must not abort the rest.
-        console.error('[checkDeposits] cryptrum getDepositList failed:', cached.paymentMethodId, e.message);
-        networksChecked.push({ paymentMethodId: cached.paymentMethodId, error: e.message });
+        console.error('[checkDeposits] cryptrum getDepositList failed:', m.id, e.message);
+        networksChecked.push({ paymentMethodId: m.id, chain: m.networkName, error: e.message });
         continue;
       }
 
       networksChecked.push({
-        paymentMethodId: cached.paymentMethodId,
-        chain:           cached.networkName,
+        paymentMethodId: m.id,
+        chain:           m.networkName,
         depositCount:    cryptrumData.deposits?.length || 0,
       });
 
@@ -189,9 +203,7 @@ exports.checkDeposits = async (req, res) => {
       }
     }
 
-    // ── (3) Final wallet snapshot for the UI ──────────────────────────
     const w = await Wallet.findOne({ userId: req.user._id }).select('balance locked');
-
     res.json({
       success: true,
       credited,
