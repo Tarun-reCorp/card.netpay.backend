@@ -5,6 +5,7 @@ const { loginLimiter, twoFactorLimiter, forgotPasswordLimiter } = require('../mi
 
 router.post('/register',              auth.register);
 router.post('/login',                 loginLimiter,         auth.login);
+router.post('/google',                loginLimiter,         auth.googleAuth);
 router.post('/2fa/verify',            twoFactorLimiter,     auth.verify2FA);
 router.post('/2fa/setup-forced',      twoFactorLimiter,     auth.setup2FAForced);
 router.post('/2fa/enable-forced',     twoFactorLimiter,     auth.enable2FAForced);

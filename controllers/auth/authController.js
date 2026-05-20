@@ -1,5 +1,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const axios = require('axios');
 const speakeasy = require('speakeasy');
 const qrcode = require('qrcode');
 const User = require('../../models/User');
@@ -204,6 +206,188 @@ exports.login = async (req, res) => {
     res.json({ success: true, token: issueAuthToken(user._id), user: await userBrandSummary(user) });
   } catch (err) {
     console.error('[500]', req.originalUrl, err); res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// POST /auth/google
+//
+// Body: { code, merchantTag?, redirectUri? }
+//
+// Google Identity Services authorization-code flow. Frontend uses
+// `google.accounts.oauth2.initCodeClient({ ux_mode: 'popup' })` to obtain an
+// authorization code, which we exchange server-side using the client secret
+// so the secret never leaves the backend. The exchange returns an ID token
+// whose payload we use to identify the user.
+//
+// IMPORTANT — flow parity with /auth/login:
+//   • merchant scoping (merchantTag) is enforced identically
+//   • 2FA gate is enforced identically (requires2FA / requires2FASetup paths)
+//   • isBlocked check identical
+//   • returns the same { token, user } shape on success
+// Anything that calls /auth/login expecting one of those response shapes
+// will get the same shape here. AuthContext consumes this without changes.
+exports.googleAuth = async (req, res) => {
+  try {
+    const code = typeof req.body?.code === 'string' ? req.body.code.trim() : null;
+    const merchantTag = typeof req.body?.merchantTag === 'string'
+      ? req.body.merchantTag.trim().toLowerCase()
+      : null;
+    // GIS popup flow uses the literal string 'postmessage' as redirect_uri —
+    // backend MUST exchange with the same value. Frontend sends 'postmessage'
+    // by default; redirectUri override exists for any future redirect flow.
+    const redirectUri = typeof req.body?.redirectUri === 'string' && req.body.redirectUri.trim()
+      ? req.body.redirectUri.trim()
+      : 'postmessage';
+
+    if (!code) return res.status(400).json({ success: false, message: 'code is required' });
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      console.error('[googleAuth] GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET missing from env');
+      return res.status(500).json({ success: false, message: 'Google auth is not configured' });
+    }
+
+    // 1. Exchange authorization code for tokens
+    let tokenData;
+    try {
+      const tokenRes = await axios.post(
+        'https://oauth2.googleapis.com/token',
+        new URLSearchParams({
+          code,
+          client_id:     process.env.GOOGLE_CLIENT_ID,
+          client_secret: process.env.GOOGLE_CLIENT_SECRET,
+          redirect_uri:  redirectUri,
+          grant_type:    'authorization_code',
+        }).toString(),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10_000 },
+      );
+      tokenData = tokenRes.data;
+    } catch (err) {
+      console.error('[googleAuth] token exchange failed:', err.response?.data || err.message);
+      return res.status(401).json({ success: false, message: 'Google authentication failed' });
+    }
+
+    const idToken = tokenData?.id_token;
+    if (!idToken) return res.status(401).json({ success: false, message: 'Google returned no ID token' });
+
+    // 2. Validate the ID token via Google's tokeninfo endpoint. We received
+    // it over HTTPS in step 1, but tokeninfo gives belt-and-braces signature
+    // + claim validation without bundling a JWKS client.
+    let profile;
+    try {
+      const verifyRes = await axios.get('https://oauth2.googleapis.com/tokeninfo', {
+        params:  { id_token: idToken },
+        timeout: 10_000,
+      });
+      profile = verifyRes.data;
+    } catch (err) {
+      console.error('[googleAuth] tokeninfo verify failed:', err.response?.data || err.message);
+      return res.status(401).json({ success: false, message: 'Failed to verify Google identity' });
+    }
+
+    // Audience must match — protects against tokens issued for other apps.
+    if (profile.aud !== process.env.GOOGLE_CLIENT_ID) {
+      console.warn('[googleAuth] token audience mismatch:', profile.aud);
+      return res.status(401).json({ success: false, message: 'Invalid Google client' });
+    }
+
+    const email = (profile.email || '').toLowerCase().trim();
+    const emailVerified = profile.email_verified === 'true' || profile.email_verified === true;
+    if (!email) return res.status(401).json({ success: false, message: 'No email returned from Google' });
+    if (!emailVerified) {
+      return res.status(401).json({ success: false, message: 'Google account email is not verified' });
+    }
+
+    // 3. Look up user. Same gates as /auth/login below.
+    let user = await User.findOne({ email }).populate({
+      path:   'merchantId',
+      select: MERCHANT_BRAND_SELECT,
+    });
+
+    if (user) {
+      if (user.isBlocked) return res.status(403).json({ success: false, message: 'Account blocked' });
+
+      // Merchant-portal scoping — mirror /auth/login exactly so a Google
+      // sign-in cannot bypass tag scoping that password sign-in enforces.
+      const userMerchant = user.merchantId;
+      if (merchantTag) {
+        if (!userMerchant) {
+          return res.status(403).json({
+            success: false,
+            message: 'This account is not registered under this merchant portal',
+          });
+        }
+        const mTag = (userMerchant.tag || '').toLowerCase();
+        if (mTag !== merchantTag) {
+          return res.status(403).json({
+            success: false,
+            message: 'This account belongs to a different merchant portal',
+          });
+        }
+      } else if (userMerchant) {
+        const portalHint = userMerchant.tag ? ` Please sign in at /${userMerchant.tag}.` : '';
+        return res.status(403).json({
+          success: false,
+          message: `This account belongs to a merchant portal.${portalHint}`,
+          merchantTag: userMerchant.tag || null,
+        });
+      }
+
+      if (user.twoFactorEnabled && user.twoFactorSecret) {
+        return res.json({
+          success: true,
+          requires2FA: true,
+          mfaChallengeToken: issueMfaChallengeToken(user._id),
+        });
+      }
+      if (user.twoFactorRequired) {
+        return res.json({
+          success: true,
+          requires2FASetup: true,
+          userId: user._id,
+          setupToken: issueSetupToken(user._id),
+        });
+      }
+
+      return res.json({
+        success: true,
+        token:   issueAuthToken(user._id),
+        user:    await userBrandSummary(user),
+      });
+    }
+
+    // 4. New user — auto-create from Google profile. password is required by
+    // schema, so set a random hash that's never used (user can run
+    // /forgot-password later if they ever want an email/password login).
+    let resolvedMerchantId = null;
+    if (merchantTag) {
+      const merchant = await Merchant.findOne({ tag: merchantTag, status: 'active' });
+      if (merchant) resolvedMerchantId = merchant._id;
+    }
+
+    const randomPassword = crypto.randomBytes(32).toString('hex');
+    const hashed = await bcrypt.hash(randomPassword, 12);
+    const name = profile.name
+      || `${profile.given_name || ''} ${profile.family_name || ''}`.trim()
+      || email.split('@')[0];
+
+    const created = await User.create({
+      name,
+      email,
+      password:   hashed,
+      firstName:  profile.given_name  || null,
+      lastName:   profile.family_name || null,
+      merchantId: resolvedMerchantId,
+    });
+    await Wallet.create({ userId: created._id });
+
+    user = await User.findById(created._id).populate({ path: 'merchantId', select: MERCHANT_BRAND_SELECT });
+    return res.status(201).json({
+      success: true,
+      token:   issueAuthToken(user._id),
+      user:    await userBrandSummary(user),
+    });
+  } catch (err) {
+    console.error('[500]', req.originalUrl, err);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
