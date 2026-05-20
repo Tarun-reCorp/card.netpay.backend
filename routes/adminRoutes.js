@@ -35,6 +35,7 @@ router.get('/users/:id/commission',           admin.getUserCommission);
 router.put('/users/:id/commission',           requireRole('ops'),   admin.updateUserCommission);
 router.get('/users/:id/crypto-addresses',     admin.listUserCryptoAddresses);
 router.post('/users/:id/crypto-addresses',    requireRole('ops'),   admin.createUserCryptoAddress);
+router.get('/users/:id/cryptrum-deposits',    admin.cryptrumDepositsForUser);
 
 // Cryptrum passthroughs
 router.get('/cryptrum/payment-methods',       admin.cryptrumPaymentMethods);

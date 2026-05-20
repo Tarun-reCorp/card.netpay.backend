@@ -26,6 +26,7 @@ router.post('/kyc/submit',  kyc.upload.fields([
 // is gated behind `requireKyc`.
 router.get('/wallet',                        wallet.getWallet);
 router.get('/wallet/payment-methods',        wallet.getPaymentMethods);
+router.get('/wallet/cryptrum/deposits/all',  wallet.cryptrumDepositsAll);
 router.get('/wallet/cryptrum/deposits',      wallet.cryptrumDeposits);
 router.get('/wallet/cryptrum/withdrawals',   wallet.cryptrumWithdrawals);
 router.post('/wallet/deposit/address',       requireKyc, wallet.getDepositAddress);

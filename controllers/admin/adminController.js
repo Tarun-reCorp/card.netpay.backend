@@ -1785,3 +1785,62 @@ exports.createUserCryptoAddress = async (req, res) => {
   }
 };
 
+// GET /admin/users/:id/cryptrum-deposits
+//
+// Admin view of a user's full Cryptrum deposit-list aggregated across every
+// payment method they have a cached address for. Mirrors the user-side
+// `/wallet/cryptrum/deposits/all` route but scoped by `:id` so admin can
+// inspect any user's pending / queued / failed Cryptrum entries — useful when
+// a deposit is reported missing or stuck and never made it into the local
+// `deposits` collection because `/deposit/check` discards non-credit-able
+// phases. One method's transient failure must not fail the whole request, so
+// individual chains are isolated with Promise.allSettled.
+exports.cryptrumDepositsForUser = async (req, res) => {
+  try {
+    const cryptrum = require('../../services/CryptrumService');
+    const user = await User.findById(req.params.id).select('cryptoAddresses email name');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const targets = (user.cryptoAddresses || []).filter(a => a.paymentMethodId && a.address);
+    if (targets.length === 0) {
+      return res.json({ success: true, deposits: [], user: { _id: user._id, email: user.email, name: user.name } });
+    }
+
+    const uniqueId = user._id.toString();
+    const results = await Promise.allSettled(
+      targets.map(t => cryptrum.getDepositList({
+        uniqueId,
+        paymentMethodId: t.paymentMethodId,
+        balanceSync:     1,
+      })),
+    );
+
+    const flat = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status === 'fulfilled' && Array.isArray(r.value.deposits)) {
+        for (const dep of r.value.deposits) {
+          flat.push({
+            ...dep,
+            paymentMethodId: targets[i].paymentMethodId,
+            chain:           targets[i].networkName,
+            asset:           targets[i].name,
+          });
+        }
+      } else if (r.status === 'rejected') {
+        console.warn('[admin.cryptrumDepositsForUser] method', targets[i].paymentMethodId, 'failed:', r.reason?.message);
+      }
+    }
+
+    flat.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    res.json({
+      success: true,
+      deposits: flat,
+      user: { _id: user._id, email: user.email, name: user.name },
+    });
+  } catch (err) {
+    console.error('[500]', req.originalUrl, err.message);
+    res.status(500).json({ success: false, message: 'Failed to load Cryptrum deposits' });
+  }
+};
+

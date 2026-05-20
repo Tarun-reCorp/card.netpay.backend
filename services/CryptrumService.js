@@ -49,19 +49,19 @@ function ensureSuccess(data, label) {
 //   0 = Pending                          (chain has not seen the tx yet)
 //   1 = Completed                        (credit-able — funds collected)
 //   2 = Queued for Verification          (txHash submitted, awaiting confs)
-//   3 = Hash Verified (Awaiting Gas)     (confs done; gas top-up pending)
-//   4 = Gas Transferred (Awaiting Collect) (gas funded; sweep pending)
+//   3 = Completed                        (credit-able — provider reports done)
+//   4 = Completed                        (credit-able — provider reports done)
 //   5 = Failed                           (terminal — will not complete)
 //
-// Only phase 1 is credit-able. 0/2/3/4 are in-flight and should re-poll.
+// Phases 1, 3, 4 are credit-able. 0 and 2 are in-flight and should re-poll.
 // 5 is terminal-failed and should stop polling.
 const CRYPTRUM_DEPOSIT_STATUS = Object.freeze({
-  0: { code: 'pending',                          label: 'Pending',                          confirmed: false, terminal: false },
-  1: { code: 'completed',                        label: 'Completed',                        confirmed: true,  terminal: true  },
-  2: { code: 'queued-for-verification',          label: 'Queued for Verification',          confirmed: false, terminal: false },
-  3: { code: 'hash-verified-awaiting-gas',       label: 'Hash Verified (Awaiting Gas)',     confirmed: false, terminal: false },
-  4: { code: 'gas-transferred-awaiting-collect', label: 'Gas Transferred (Awaiting Collect)', confirmed: false, terminal: false },
-  5: { code: 'failed',                           label: 'Failed',                           confirmed: false, terminal: true  },
+  0: { code: 'pending',                  label: 'Pending',                  confirmed: false, terminal: false },
+  1: { code: 'completed',                label: 'Completed',                confirmed: true,  terminal: true  },
+  2: { code: 'queued-for-verification',  label: 'Queued for Verification',  confirmed: false, terminal: false },
+  3: { code: 'completed',                label: 'Completed',                confirmed: true,  terminal: true  },
+  4: { code: 'completed',                label: 'Completed',                confirmed: true,  terminal: true  },
+  5: { code: 'failed',                   label: 'Failed',                   confirmed: false, terminal: true  },
 });
 
 function describeDepositStatus(raw) {
@@ -212,9 +212,9 @@ async function getDepositList(opts = {}) {
         statusCode:   phase.code,
         // Human-readable label — surface to the user as-is.
         statusLabel:  phase.label,
-        // True only for phase 1 (the only credit-able phase).
+        // True for phases 1, 3, 4 (every credit-able "Completed" code).
         confirmed:    phase.confirmed,
-        // True for phases 1 and 5 — caller should stop polling.
+        // True for phases 1, 3, 4, 5 — caller should stop polling.
         terminal:     phase.terminal,
         toAddress:    row.to_address || row.address || null,
         fromAddress:  row.from_address || null,

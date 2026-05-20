@@ -63,6 +63,57 @@ exports.cryptrumDeposits = async (req, res) => {
   }
 };
 
+// GET /user/wallet/cryptrum/deposits/all
+//
+// Aggregated deposit-list across every payment method the user has cached.
+// Surfaces non-credit-able phases (pending / queued / failed / etc.) which
+// `/deposit/check` discards via the `skipped[]` array and never persists.
+// This is the data source for the "Pending & failed" panel on the Deposit
+// page. Single per-method failures don't fail the request — Promise.allSettled
+// keeps partial results so one chain being down still shows the others.
+exports.cryptrumDepositsAll = async (req, res) => {
+  try {
+    const User = require('../../models/User');
+    const user = await User.findById(req.user._id).select('cryptoAddresses');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const targets = (user.cryptoAddresses || []).filter(a => a.paymentMethodId && a.address);
+    if (targets.length === 0) return res.json({ success: true, deposits: [] });
+
+    const uniqueId = req.user._id.toString();
+    const results = await Promise.allSettled(
+      targets.map(t => cryptrum.getDepositList({
+        uniqueId,
+        paymentMethodId: t.paymentMethodId,
+        balanceSync:     1,
+      })),
+    );
+
+    const flat = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status === 'fulfilled' && Array.isArray(r.value.deposits)) {
+        for (const dep of r.value.deposits) {
+          flat.push({
+            ...dep,
+            paymentMethodId: targets[i].paymentMethodId,
+            chain:           targets[i].networkName,
+            asset:           targets[i].name,
+          });
+        }
+      } else if (r.status === 'rejected') {
+        console.warn('[cryptrumDepositsAll] method', targets[i].paymentMethodId, 'failed:', r.reason?.message);
+      }
+    }
+
+    flat.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    res.json({ success: true, deposits: flat });
+  } catch (err) {
+    console.error('[cryptrumDepositsAll]', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load deposit list' });
+  }
+};
+
 // POST /user/wallet/deposit/check  body: { paymentMethodId? }
 //
 // Reconciles confirmed deposits from Cryptrum into this user's wallet.
@@ -161,8 +212,8 @@ exports.checkDeposits = async (req, res) => {
 //   { skipped:  { txHash, reason, ... } } — see reason codes below.
 //
 // Reason codes:
-//   unconfirmed / pending / queued-for-verification / hash-verified-awaiting-gas
-//   gas-transferred-awaiting-collect / failed   — see CRYPTRUM_DEPOSIT_STATUS
+//   unconfirmed / pending / queued-for-verification / failed
+//                                                — see CRYPTRUM_DEPOSIT_STATUS
 //   missing-txhash    — Cryptrum returned a confirmed row with no txHash
 //   wrong-user        — uniqueId from Cryptrum did not match this user
 //   address-mismatch  — toAddress did not match the cached address
@@ -303,6 +354,15 @@ exports.cryptrumWithdrawals = async (req, res) => {
 // Body: { paymentMethodId: number }  — Cryptrum payment_method_id
 // Returns an existing cached address from user.cryptoAddresses, or fetches a
 // fresh one from Cryptrum and persists it on the user.
+//
+// EVM cross-asset safety net: when the requested method is EVM, every other
+// EVM method we don't yet have cached is registered with Cryptrum in the same
+// request. EVM addresses are HD-derived from one key, so the address is the
+// same on all EVM chains — but Cryptrum's /deposit-list is filtered by
+// (uniqueId × paymentMethodId), so without an upfront registration a user who
+// opens "BNB" and accidentally sends USDT-BEP20 to that address would have no
+// (uniqueId × BEP20-USDT) entry for Cryptrum to surface the deposit under.
+// Registering all EVM methods at the first generation closes that gap.
 exports.getDepositAddress = async (req, res) => {
   try {
     const paymentMethodId = Number(req.body.paymentMethodId);
@@ -348,6 +408,43 @@ exports.getDepositAddress = async (req, res) => {
       networkType: method.networkType,
       chainId:     method.chainId,
     });
+
+    // Auto-register sibling EVM methods — best-effort, parallel. A single
+    // sibling failure (rate limit, transient 5xx) must not fail the primary
+    // request, so each result is checked independently.
+    let registeredSiblings = 0;
+    if (method.networkType === 'EVM') {
+      const siblings = items.filter(m =>
+        m.networkType === 'EVM' &&
+        m.id !== paymentMethodId &&
+        m.depositEnabled &&
+        !user.cryptoAddresses.some(a => a.paymentMethodId === m.id),
+      );
+
+      if (siblings.length > 0) {
+        const results = await Promise.allSettled(
+          siblings.map(s =>
+            cryptrum.fetchAddress(uniqueId, s.id).then(r => ({ method: s, address: r.address })),
+          ),
+        );
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value.address) {
+            user.cryptoAddresses.push({
+              paymentMethodId: r.value.method.id,
+              address:         r.value.address,
+              name:            r.value.method.name,
+              networkName:     r.value.method.networkName,
+              networkType:     r.value.method.networkType,
+              chainId:         r.value.method.chainId,
+            });
+            registeredSiblings++;
+          } else if (r.status === 'rejected') {
+            console.warn('[getDepositAddress] sibling register failed:', r.reason?.message);
+          }
+        }
+      }
+    }
+
     await user.save();
 
     res.json({
@@ -357,6 +454,7 @@ exports.getDepositAddress = async (req, res) => {
       chain: method.networkName,
       coinName: method.name,
       cached: false,
+      siblingsRegistered: registeredSiblings,
     });
   } catch (err) {
     console.error('[Cryptrum]', req.originalUrl, err.message);
